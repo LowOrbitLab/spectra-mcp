@@ -217,7 +217,7 @@ async def binary_status(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def fetch_binary(force: bool = False, ctx: Context = None) -> Dict[str, Any]:
+async def fetch_binary(ctx: Context, force: bool = False) -> Dict[str, Any]:
     """Download (and verify) the patched Firefox binary if not already cached.
 
     One-time ~100 MB download, SHA256-verified. Set ``force=True`` to re-download
@@ -278,6 +278,7 @@ async def fetch_binary(force: bool = False, ctx: Context = None) -> Dict[str, An
 
 @mcp.tool()
 async def start_session(
+    ctx: Context,
     seed: Optional[int] = None,
     headless: bool = True,
     proxy_server: str = "",
@@ -288,7 +289,6 @@ async def start_session(
     humanize: bool = True,
     profile_dir: str = "",
     prep_recaptcha: bool = False,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Start an anti-detect browser session with a fresh (or seeded) fingerprint.
 
@@ -375,7 +375,7 @@ async def start_session(
 
 
 @mcp.tool()
-async def close_session(session_id: str, ctx: Context = None) -> Dict[str, Any]:
+async def close_session(session_id: str, ctx: Context) -> Dict[str, Any]:
     """Close a browser session and free its Firefox process."""
     async with _LOCK:
         session = _SESSIONS.pop(session_id, None)
@@ -435,7 +435,7 @@ async def session_info(session_id: str, ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def new_page(session_id: str, ctx: Context = None) -> Dict[str, Any]:
+async def new_page(session_id: str, ctx: Context) -> Dict[str, Any]:
     """Open a new page (tab) in the session and make it the active page."""
     try:
         s = await _get_session(session_id)
@@ -452,7 +452,7 @@ async def new_page(session_id: str, ctx: Context = None) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def close_page(session_id: str, page_id: Optional[int] = None, ctx: Context = None) -> Dict[str, Any]:
+async def close_page(session_id: str, ctx: Context, page_id: Optional[int] = None) -> Dict[str, Any]:
     """Close a page. Defaults to the active page. Switches active page if needed."""
     try:
         s = await _get_session(session_id)
@@ -478,7 +478,7 @@ async def close_page(session_id: str, page_id: Optional[int] = None, ctx: Contex
 
 
 @mcp.tool()
-async def switch_page(session_id: str, page_id: int, ctx: Context = None) -> Dict[str, Any]:
+async def switch_page(session_id: str, page_id: int, ctx: Context) -> Dict[str, Any]:
     """Set the active page (subsequent tools act on it)."""
     try:
         s = await _get_session(session_id)
@@ -549,9 +549,9 @@ def _pw_err(s: _Session, what: str, exc: Exception) -> Dict[str, Any]:
 async def goto(
     session_id: str,
     url: str,
+    ctx: Context,
     timeout_ms: int = 30000,
     wait_until: str = "load",
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Navigate the active page to ``url``.
 
@@ -570,7 +570,7 @@ async def goto(
 
 
 @mcp.tool()
-async def go_back(session_id: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
+async def go_back(session_id: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -583,7 +583,7 @@ async def go_back(session_id: str, timeout_ms: int = 30000, ctx: Context = None)
 
 
 @mcp.tool()
-async def go_forward(session_id: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
+async def go_forward(session_id: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -596,7 +596,7 @@ async def go_forward(session_id: str, timeout_ms: int = 30000, ctx: Context = No
 
 
 @mcp.tool()
-async def reload(session_id: str, timeout_ms: int = 30000, wait_until: str = "load", ctx: Context = None) -> Dict[str, Any]:
+async def reload(session_id: str, ctx: Context, timeout_ms: int = 30000, wait_until: str = "load") -> Dict[str, Any]:
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -618,10 +618,10 @@ async def reload(session_id: str, timeout_ms: int = 30000, wait_until: str = "lo
 async def click(
     session_id: str,
     selector: str,
+    ctx: Context,
     timeout_ms: int = 30000,
     button: str = "left",
     click_count: int = 1,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Click an element matched by ``selector`` (humanized Bezier mouse path)."""
     try:
@@ -640,8 +640,8 @@ async def fill(
     session_id: str,
     selector: str,
     value: str,
+    ctx: Context,
     timeout_ms: int = 30000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Clear and fill an input/textarea with ``value`` (atomic, not per-keystroke)."""
     try:
@@ -660,9 +660,9 @@ async def type_text(
     session_id: str,
     selector: str,
     text: str,
+    ctx: Context,
     delay_ms: int = 0,
     timeout_ms: int = 30000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Type ``text`` into an element one keystroke at a time (use for key-by-key input)."""
     try:
@@ -681,8 +681,8 @@ async def press_key(
     session_id: str,
     selector: str,
     key: str,
+    ctx: Context,
     timeout_ms: int = 30000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Focus ``selector`` and press a keyboard ``key`` (e.g. ``Enter``, ``Tab``, ``ArrowDown``)."""
     try:
@@ -697,7 +697,7 @@ async def press_key(
 
 
 @mcp.tool()
-async def keyboard_press(session_id: str, key: str, ctx: Context = None) -> Dict[str, Any]:
+async def keyboard_press(session_id: str, key: str, ctx: Context) -> Dict[str, Any]:
     """Press a keyboard ``key`` on the focused element (no selector)."""
     try:
         async with _use_page(session_id) as (s, page):
@@ -715,8 +715,8 @@ async def select_option(
     session_id: str,
     selector: str,
     value: str,
+    ctx: Context,
     timeout_ms: int = 30000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Select an ``<option>`` by value in a ``<select>``."""
     try:
@@ -734,8 +734,8 @@ async def select_option(
 async def hover(
     session_id: str,
     selector: str,
+    ctx: Context,
     timeout_ms: int = 30000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Hover an element (humanized mouse path)."""
     try:
@@ -750,7 +750,7 @@ async def hover(
 
 
 @mcp.tool()
-async def focus(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
+async def focus(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -763,7 +763,7 @@ async def focus(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Co
 
 
 @mcp.tool()
-async def check(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
+async def check(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     """Check a checkbox/radio matched by ``selector``."""
     try:
         async with _use_page(session_id) as (s, page):
@@ -777,7 +777,7 @@ async def check(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Co
 
 
 @mcp.tool()
-async def uncheck(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
+async def uncheck(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     """Uncheck a checkbox matched by ``selector``."""
     try:
         async with _use_page(session_id) as (s, page):
@@ -793,10 +793,10 @@ async def uncheck(session_id: str, selector: str, timeout_ms: int = 30000, ctx: 
 @mcp.tool()
 async def scroll(
     session_id: str,
+    ctx: Context,
     dx: int = 0,
     dy: int = 0,
     selector: str = "",
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Scroll the page by (dx, dy) pixels. If ``selector`` is given, scroll that element into view first."""
     try:
@@ -820,7 +820,7 @@ async def scroll(
 
 
 @mcp.tool()
-async def get_url(session_id: str, ctx: Context = None) -> Dict[str, Any]:
+async def get_url(session_id: str, ctx: Context) -> Dict[str, Any]:
     try:
         async with _use_page(session_id) as (s, page):
             return _ok(url=page.url)
@@ -829,7 +829,7 @@ async def get_url(session_id: str, ctx: Context = None) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def get_title(session_id: str, ctx: Context = None) -> Dict[str, Any]:
+async def get_title(session_id: str, ctx: Context) -> Dict[str, Any]:
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -844,9 +844,9 @@ async def get_title(session_id: str, ctx: Context = None) -> Dict[str, Any]:
 @mcp.tool()
 async def get_text(
     session_id: str,
+    ctx: Context,
     selector: str = "",
     max_chars: int = 20000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Get visible text. Empty ``selector`` = the whole body. Output is capped to ``max_chars``."""
     try:
@@ -870,9 +870,9 @@ async def get_text(
 @mcp.tool()
 async def get_html(
     session_id: str,
+    ctx: Context,
     selector: str = "",
     max_chars: int = 20000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Get HTML. Empty ``selector`` = full document (``page.content()``). Capped to ``max_chars``."""
     try:
@@ -897,7 +897,7 @@ async def get_attribute(
     session_id: str,
     selector: str,
     attribute: str,
-    ctx: Context = None,
+    ctx: Context,
 ) -> Dict[str, Any]:
     """Return a single attribute of the first element matching ``selector``."""
     try:
@@ -915,8 +915,8 @@ async def get_attribute(
 async def query_elements(
     session_id: str,
     selector: str,
+    ctx: Context,
     max_results: int = 50,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Return a structured snapshot of elements matching ``selector``.
 
@@ -960,8 +960,8 @@ async def query_elements(
 async def is_visible(
     session_id: str,
     selector: str,
+    ctx: Context,
     timeout_ms: int = 5000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Check whether ``selector`` matches a visible element (with a short wait)."""
     try:
@@ -984,10 +984,10 @@ async def is_visible(
 @mcp.tool()
 async def screenshot(
     session_id: str,
+    ctx: Context,
     full_page: bool = False,
     image_format: str = "jpeg",
     quality: int = 85,
-    ctx: Context = None,
 ) -> Image:
     """Capture a screenshot of the active page and return it as image content.
 
@@ -1022,9 +1022,9 @@ async def screenshot(
 async def wait_for_selector(
     session_id: str,
     selector: str,
+    ctx: Context,
     timeout_ms: int = 30000,
     state: str = "visible",
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Wait until an element matching ``selector`` reaches ``state``.
 
@@ -1042,7 +1042,7 @@ async def wait_for_selector(
 
 
 @mcp.tool()
-async def wait_for_timeout(session_id: str, ms: int, ctx: Context = None) -> Dict[str, Any]:
+async def wait_for_timeout(session_id: str, ms: int, ctx: Context) -> Dict[str, Any]:
     """Sleep for ``ms`` milliseconds (used to let async page updates settle)."""
     try:
         async with _use_page(session_id) as (s, page):
@@ -1064,9 +1064,9 @@ async def wait_for_timeout(session_id: str, ms: int, ctx: Context = None) -> Dic
 async def evaluate(
     session_id: str,
     script: str,
+    ctx: Context,
     arg: Any = None,
     timeout_ms: int = 30000,
-    ctx: Context = None,
 ) -> Dict[str, Any]:
     """Execute arbitrary JavaScript in the active page and return its value.
 
