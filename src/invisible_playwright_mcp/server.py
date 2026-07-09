@@ -57,7 +57,6 @@ class _Session:
     seed: int
     persistent: bool
     primary_context: Any = None  # cached shared BrowserContext (Browser path only)
-    contexts: List[Any] = field(default_factory=list)  # contexts to close on teardown
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # lifecycle guard (close-vs-inflight)
     pages: Dict[int, Any] = field(default_factory=dict)  # page_id -> Page
     next_page_id: int = 1
@@ -119,7 +118,6 @@ async def _make_page(session: _Session) -> Any:
         if session.primary_context is None:
             ctx = await boc.new_context()
             session.primary_context = ctx
-            session.contexts.append(ctx)
         else:
             ctx = session.primary_context
         page = await ctx.new_page()
@@ -146,7 +144,8 @@ async def _close_session(session: _Session) -> None:
         got_lock = True
     except asyncio.TimeoutError:
         _log.warning(
-            "close_session %s: in-flight tool did not yield within %.1fs; force-closing",
+            "close_session %s: in-flight tool did not yield within %.1fs; "
+            "force-closing (best-effort: in-flight tail code may race with teardown)",
             session.session_id, _CLOSE_DRAIN_TIMEOUT,
         )
     try:
@@ -156,12 +155,11 @@ async def _close_session(session: _Session) -> None:
                     await page.close()
             except Exception:
                 pass
-        for ctx in session.contexts:
+        if session.primary_context is not None:
             try:
-                await ctx.close()
+                await session.primary_context.close()
             except Exception:
                 pass
-        session.contexts.clear()
         session.pages.clear()
         try:
             await session.ipw.__aexit__(None, None, None)
