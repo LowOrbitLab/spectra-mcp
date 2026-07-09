@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
+import shutil
 import sys
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import Context, FastMCP, Image
@@ -61,6 +65,16 @@ class _Session:
     next_page_id: int = 1
     active_page_id: Optional[int] = None
     closed: bool = False
+    # --- capability state (all defaulted; mutable ones need default_factory or
+    # the dataclass raises at import) ---
+    dialog_action: str = "accept"  # how JS dialogs are auto-handled: accept|dismiss
+    dialog_prompt_text: str = ""  # text submitted for prompt() when accepting
+    dialog_log: List[dict] = field(default_factory=list)  # capped, newest-last
+    downloads: List[dict] = field(default_factory=list)  # history for list_downloads
+    downloads_dir: Optional[str] = None  # per-session tempdir (made in start_session)
+    storage_state_path: Optional[str] = None  # seed cookies/localStorage at ctx creation
+    _dl_seq: int = 0  # monotonic download counter (collision-free filenames)
+    _ctx_handlers_done: bool = False  # idempotency guard for context.on("dialog")
 
 
 _SESSIONS: Dict[str, _Session] = {}
@@ -71,6 +85,9 @@ _LOCK = asyncio.Lock()
 # that don't yield within this window get force-closed; their tool's except
 # block sees s.closed=True and returns a clean _err("session closed").
 _CLOSE_DRAIN_TIMEOUT = 5.0
+
+# Max JS dialogs retained per session in _Session.dialog_log (newest kept).
+_DIALOG_CAP = 50
 
 
 def _ok(**kw: Any) -> Dict[str, Any]:
@@ -103,6 +120,147 @@ def _active_page(session: _Session) -> Any:
     return page
 
 
+# Shared JS for query_elements / frame_query_elements: a compact, LLM-friendly
+# snapshot of matched elements (used against a Page or a Frame realm).
+_QUERY_ELEMENTS_JS = """
+(params) => {
+  const els = Array.from(document.querySelectorAll(params.sel)).slice(0, params.limit);
+  return els.map(e => {
+    const r = e.getBoundingClientRect();
+    return {
+      tag: e.tagName.toLowerCase(),
+      id: e.id || null,
+      name: e.getAttribute('name'),
+      type: e.getAttribute('type'),
+      role: e.getAttribute('role'),
+      href: e.tagName === 'A' ? (e.href || null) : null,
+      value: ('value' in e) ? e.value : null,
+      placeholder: e.getAttribute('placeholder'),
+      text: (e.innerText || '').slice(0, 200),
+      visible: !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length),
+      rect: { x: r.x, y: r.y, w: r.width, h: r.height }
+    };
+  });
+}
+"""
+
+
+def _alloc_pid(session: _Session) -> int:
+    """Allocate the next page id. Centralized so _make_page and the popup handler
+    share one counter; always call AFTER the Page object exists so a popup
+    arriving during an ``await ctx.new_page()`` can't collide."""
+    pid = session.next_page_id
+    session.next_page_id += 1
+    return pid
+
+
+def _context_of(session: _Session) -> Any:
+    """The session's BrowserContext: the persistent context itself, or the shared
+    ``primary_context`` cached on the Browser path (None until _make_page runs)."""
+    return session.browser_or_ctx if session.persistent else session.primary_context
+
+
+async def _on_dialog(session: _Session, dialog: Any) -> None:
+    """Auto-handle a JS dialog per the session policy.
+
+    Registering any dialog listener means Playwright will NOT auto-dismiss — the
+    handler MUST accept or dismiss or the page freezes. So we handle FIRST (with a
+    dismiss fallback) and only then record it; nothing above the accept/dismiss is
+    allowed to throw. Runs lock-free (a dialog fires *during* a lock-holding tool's
+    await, e.g. click → alert(); taking the lock here would deadlock)."""
+    try:
+        rec = {"type": dialog.type, "message": dialog.message,
+               "default_value": dialog.default_value}
+    except Exception:
+        rec = {"type": None, "message": None, "default_value": None}
+    action = session.dialog_action
+    try:
+        if action == "accept":
+            await dialog.accept(session.dialog_prompt_text or None)
+        else:
+            await dialog.dismiss()
+        rec["action"] = action
+    except Exception as exc:
+        rec["action"] = f"error: {exc}"
+        _log.warning("dialog handling failed on session %s: %s", session.session_id, exc)
+    session.dialog_log.append(rec)
+    if len(session.dialog_log) > _DIALOG_CAP:
+        del session.dialog_log[: len(session.dialog_log) - _DIALOG_CAP]
+
+
+def _on_popup(session: _Session, popup: Any) -> None:
+    """Adopt a popup / new tab (OAuth, window.open, target=_blank) into the session.
+
+    Sync (runs inline during the emit): assign an id and track it so list_pages /
+    switch_page see it. Does NOT steal focus — active_page_id is unchanged. Also
+    registers handlers on the popup so it can spawn its own popups."""
+    if session.closed:
+        return
+    pid = _alloc_pid(session)
+    session.pages[pid] = popup
+    _register_page_handlers(session, popup)
+
+
+def _register_page_handlers(session: _Session, page: Any) -> None:
+    """Per-page handlers. Popups are a page-level event; dialogs are handled at the
+    context level (see _register_context_handlers), so they aren't wired here."""
+    page.on("popup", partial(_on_popup, session))
+
+
+def _register_context_handlers(session: _Session) -> None:
+    """Register the dialog listener once, at CONTEXT level, so it covers every tab
+    (incl. popups) and the ``dialog.page is None`` case. Idempotent."""
+    if session._ctx_handlers_done:
+        return
+    c = _context_of(session)
+    if c is None:
+        return
+    c.on("dialog", partial(_on_dialog, session))
+    session._ctx_handlers_done = True
+
+
+def _unique_download_path(session: _Session, suggested: str) -> str:
+    """A collision-free path under the session download dir (``N-suggested``)."""
+    session._dl_seq += 1
+    name = os.path.basename(suggested or "download") or "download"
+    base = session.downloads_dir or tempfile.gettempdir()
+    return os.path.join(base, f"{session._dl_seq}-{name}")
+
+
+def _frame_locator(page: Any, frame_selector: str) -> Any:
+    """Resolve a (possibly nested) iframe to a FrameLocator. ``frame_selector`` is a
+    CSS selector for the <iframe>; chain nested frames with ``>>>``. FrameLocator
+    auto-waits for the frame at action time (a wrong selector surfaces as a timeout)."""
+    segments = [seg.strip() for seg in frame_selector.split(">>>") if seg.strip()]
+    if not segments:
+        raise ValueError("frame_selector is empty")
+    fl = page.frame_locator(segments[0])
+    for seg in segments[1:]:
+        fl = fl.frame_locator(seg)
+    return fl
+
+
+async def _resolve_frame(page: Any, frame_selector: str) -> Any:
+    """Resolve a (possibly nested) iframe to a real Frame via element-handle descent
+    (``query_selector(seg).content_frame()`` per ``>>>`` segment). Needed for
+    frame.evaluate(), which the page-level evaluate can't reach across frames.
+    Does not long-wait: a missing/absent frame raises promptly."""
+    segments = [seg.strip() for seg in frame_selector.split(">>>") if seg.strip()]
+    if not segments:
+        raise ValueError("frame_selector is empty")
+    node = page
+    frame = None
+    for seg in segments:
+        el = await node.query_selector(seg)
+        if el is None:
+            raise RuntimeError(f"iframe not found: {seg!r}")
+        frame = await el.content_frame()
+        if frame is None:
+            raise RuntimeError(f"element is not an iframe: {seg!r}")
+        node = frame
+    return frame
+
+
 async def _make_page(session: _Session) -> Any:
     """Create a new page (real tab) in the session's shared BrowserContext.
 
@@ -110,12 +268,18 @@ async def _make_page(session: _Session) -> Any:
     caches it on the session; subsequent calls open pages in that same context,
     so all pages share cookies/storage — matching the persistent path and real
     browser tab behaviour. The patched ``new_context()`` injects fingerprint
-    viewport/screen/timezone/locale defaults once, at context creation.
+    viewport/screen/timezone/locale defaults once, at context creation, and
+    forwards ``storage_state=`` when the session was started with one.
     """
     boc = session.browser_or_ctx
     if hasattr(boc, "new_context"):
         if session.primary_context is None:
-            ctx = await boc.new_context()
+            kwargs: Dict[str, Any] = {}
+            if session.storage_state_path:
+                # Seed cookies+localStorage at creation (applied exactly once;
+                # later new_page() calls reuse this cached context).
+                kwargs["storage_state"] = session.storage_state_path
+            ctx = await boc.new_context(**kwargs)
             session.primary_context = ctx
         else:
             ctx = session.primary_context
@@ -123,10 +287,10 @@ async def _make_page(session: _Session) -> Any:
     else:
         # Persistent BrowserContext path: new_page() shares the single context.
         page = await boc.new_page()
-    pid = session.next_page_id
-    session.next_page_id += 1
+    pid = _alloc_pid(session)
     session.pages[pid] = page
     session.active_page_id = pid
+    _register_page_handlers(session, page)
     return page, pid
 
 
@@ -164,6 +328,11 @@ async def _close_session(session: _Session) -> None:
             await session.ipw.__aexit__(None, None, None)
         except Exception as exc:
             _log.warning("error tearing down session %s: %s", session.session_id, exc)
+        # Best-effort removal of the per-session download tempdir. Safe now that
+        # downloads save synchronously inside their tool (no fire-and-forget
+        # save_as can still hold a file handle open here).
+        if session.downloads_dir:
+            shutil.rmtree(session.downloads_dir, ignore_errors=True)
     finally:
         if got_lock:
             session.lock.release()
@@ -289,6 +458,7 @@ async def start_session(
     humanize: bool = True,
     profile_dir: str = "",
     prep_recaptcha: bool = False,
+    storage_state_path: str = "",
 ) -> Dict[str, Any]:
     """Start an anti-detect browser session with a fresh (or seeded) fingerprint.
 
@@ -316,7 +486,21 @@ async def start_session(
         Optional persistent profile path (enables a persistent context).
     prep_recaptcha : bool
         Pre-seed reCAPTCHA cookies (only when not using a persistent profile).
+    storage_state_path : str
+        Path to a JSON file saved by ``save_storage_state`` — seeds the context's
+        cookies + localStorage at creation so a logged-in state resumes without
+        re-authenticating. Non-persistent sessions only (cannot be combined with
+        ``profile_dir``, whose on-disk profile already persists state).
     """
+    if storage_state_path:
+        if profile_dir:
+            return _err(
+                "storage_state_path cannot be combined with profile_dir: a "
+                "persistent profile already persists cookies/localStorage"
+            )
+        if not os.path.isfile(storage_state_path):
+            return _err(f"storage_state_path not found: {storage_state_path!r}")
+
     proxy: Optional[Dict[str, str]] = None
     if proxy_server:
         proxy = {"server": proxy_server}
@@ -355,11 +539,17 @@ async def start_session(
         seed=ipw.seed,
         persistent=persistent,
     )
+    session.storage_state_path = storage_state_path or None
+    # Per-session download dir; captured files land here and are removed on close.
+    session.downloads_dir = tempfile.mkdtemp(prefix=f"ipwmcp-{sid}-")
     try:
         page, pid = await _make_page(session)
     except Exception as exc:
         await _close_session(session)
         return _err(f"initial page failed: {exc}")
+    # Context now exists (primary_context on Browser path / the persistent context):
+    # register the session-wide dialog handler so no tab can freeze on alert().
+    _register_context_handlers(session)
 
     async with _LOCK:
         _SESSIONS[sid] = session
@@ -924,31 +1114,10 @@ async def query_elements(
     placeholder, visible flag and bounding rect. Useful for the LLM to decide
     what to click next without scraping raw HTML.
     """
-    js = """
-    (params) => {
-      const els = Array.from(document.querySelectorAll(params.sel)).slice(0, params.limit);
-      return els.map(e => {
-        const r = e.getBoundingClientRect();
-        return {
-          tag: e.tagName.toLowerCase(),
-          id: e.id || null,
-          name: e.getAttribute('name'),
-          type: e.getAttribute('type'),
-          role: e.getAttribute('role'),
-          href: e.tagName === 'A' ? (e.href || null) : null,
-          value: ('value' in e) ? e.value : null,
-          placeholder: e.getAttribute('placeholder'),
-          text: (e.innerText || '').slice(0, 200),
-          visible: !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length),
-          rect: { x: r.x, y: r.y, w: r.width, h: r.height }
-        };
-      });
-    }
-    """
     try:
         async with _use_page(session_id) as (s, page):
             try:
-                data = await page.evaluate(js, {"sel": selector, "limit": max_results})
+                data = await page.evaluate(_QUERY_ELEMENTS_JS, {"sel": selector, "limit": max_results})
             except Exception as exc:
                 return _pw_err(s, "query_elements", exc)
             return _ok(selector=selector, count=len(data), elements=data)
@@ -1094,6 +1263,628 @@ async def evaluate(
             except Exception as exc:
                 return _pw_err(s, "evaluate", exc)
             return _ok(result=result)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+# --------------------------------------------------------------------------- #
+# Files: upload & download
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def set_input_files(
+    session_id: str,
+    selector: str,
+    files: List[str],
+    ctx: Context,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Set the file(s) for a file ``<input>`` matched by ``selector`` (upload).
+
+    ``files`` is a list of paths **on the machine running this server** (not the
+    LLM's host); pass an empty list to clear the selection. Files fetched with
+    ``download`` live under the session download dir and can be re-uploaded here.
+
+    Note: the patched anti-detect build (as of firefox-15) does not fire the
+    Juggler file-input events this relies on, so it may time out there; the call
+    is standard Playwright and works on a capable/newer binary.
+    """
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.set_input_files(selector, list(files), timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "set_input_files", exc)
+            return _ok(selector=selector, count=len(files))
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def download(
+    session_id: str,
+    trigger_selector: str,
+    ctx: Context,
+    save_path: str = "",
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Download a file by clicking ``trigger_selector`` and capturing the result.
+
+    Wraps the click in Playwright's ``expect_download`` so the file the click
+    initiates is caught and saved — use this instead of ``click`` when a click
+    produces a download. Saves to ``save_path`` if given, else an auto-named file
+    under the session download dir. Returns the saved ``path``, ``suggested_filename``
+    and source ``url``.
+
+    Note: the patched anti-detect build (as of firefox-15) does not emit download
+    events, so this may time out there; the call is standard Playwright and works
+    on a capable/newer binary.
+    """
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                async with page.expect_download(timeout=timeout_ms) as dl_info:
+                    await page.click(trigger_selector, timeout=timeout_ms)
+                dl = await dl_info.value
+                dest = save_path or _unique_download_path(s, dl.suggested_filename)
+                parent = os.path.dirname(dest)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                await dl.save_as(dest)
+            except Exception as exc:
+                return _pw_err(s, "download", exc)
+            rec = {"path": dest, "suggested_filename": dl.suggested_filename, "url": dl.url}
+            s.downloads.append(rec)
+            return _ok(**rec)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def list_downloads(session_id: str, ctx: Context) -> Dict[str, Any]:
+    """List files downloaded in this session (path, suggested_filename, url)."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        return _ok(downloads=list(s.downloads), count=len(s.downloads))
+
+
+# --------------------------------------------------------------------------- #
+# Drag & coordinate mouse
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def drag_and_drop(
+    session_id: str,
+    source_selector: str,
+    target_selector: str,
+    ctx: Context,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Drag the ``source_selector`` element and drop it onto ``target_selector``.
+
+    Note: the patched anti-detect build (as of firefox-15) does not support the
+    drag Juggler path, so this may time out there; the call is standard Playwright
+    and works on a capable/newer binary. For coordinate drags (sliders/canvas) see
+    ``mouse_drag``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.drag_and_drop(source_selector, target_selector, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "drag_and_drop", exc)
+            return _ok(source=source_selector, target=target_selector)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def mouse_drag(
+    session_id: str,
+    from_x: float,
+    from_y: float,
+    to_x: float,
+    to_y: float,
+    ctx: Context,
+    steps: int = 10,
+) -> Dict[str, Any]:
+    """Press at (from_x, from_y), drag to (to_x, to_y) over ``steps`` moves, release.
+
+    Coordinate-based drag for sliders, canvas handles and slider-captchas (no
+    selector). Motion is humanized by the patched browser when humanize is on.
+
+    Note: on the patched anti-detect build, hold-drag only works when the session
+    was started with ``humanize=False`` (the humanized mouse can't hold-and-drag).
+    """
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.mouse.move(from_x, from_y)
+                await page.mouse.down()
+                await page.mouse.move(to_x, to_y, steps=max(1, steps))
+                await page.mouse.up()
+            except Exception as exc:
+                return _pw_err(s, "mouse_drag", exc)
+            return _ok(from_xy=[from_x, from_y], to_xy=[to_x, to_y], steps=steps)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def mouse_move(
+    session_id: str,
+    x: float,
+    y: float,
+    ctx: Context,
+    steps: int = 1,
+) -> Dict[str, Any]:
+    """Move the mouse to viewport coordinate (x, y) over ``steps`` intermediate moves."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.mouse.move(x, y, steps=max(1, steps))
+            except Exception as exc:
+                return _pw_err(s, "mouse_move", exc)
+            return _ok(x=x, y=y)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def mouse_click(
+    session_id: str,
+    x: float,
+    y: float,
+    ctx: Context,
+    button: str = "left",
+    click_count: int = 1,
+) -> Dict[str, Any]:
+    """Click at viewport coordinate (x, y) — for canvas/SVG/custom controls (no selector).
+
+    Coordinates are viewport pixels; read them from ``screenshot`` or the ``rect``
+    fields of ``query_elements``. Combine with ``keyboard_down``/``keyboard_up`` for
+    Shift/Ctrl+click."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.mouse.click(x, y, button=button, click_count=click_count)
+            except Exception as exc:
+                return _pw_err(s, "mouse_click", exc)
+            return _ok(x=x, y=y, button=button, click_count=click_count)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+# --------------------------------------------------------------------------- #
+# Keyboard (modifier hold / focused-element typing)
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def keyboard_down(session_id: str, key: str, ctx: Context) -> Dict[str, Any]:
+    """Hold a key down (e.g. ``Shift``, ``Control``, ``Meta``).
+
+    Pair with ``mouse_click`` / ``click`` for Shift+click, or another key for
+    combos (Ctrl+A). Always release it later with ``keyboard_up``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.keyboard.down(key)
+            except Exception as exc:
+                return _pw_err(s, "keyboard_down", exc)
+            return _ok(key=key)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def keyboard_up(session_id: str, key: str, ctx: Context) -> Dict[str, Any]:
+    """Release a key previously held with ``keyboard_down``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.keyboard.up(key)
+            except Exception as exc:
+                return _pw_err(s, "keyboard_up", exc)
+            return _ok(key=key)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def keyboard_type(
+    session_id: str,
+    text: str,
+    ctx: Context,
+    delay_ms: int = 0,
+) -> Dict[str, Any]:
+    """Type ``text`` into the currently focused element, key by key (no selector).
+
+    Complements ``type_text`` (which targets a selector). Use after focusing via
+    ``mouse_click`` / ``focus`` — handy for canvas or custom widgets."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.keyboard.type(text, delay=delay_ms)
+            except Exception as exc:
+                return _pw_err(s, "keyboard_type", exc)
+            return _ok(length=len(text))
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+# --------------------------------------------------------------------------- #
+# Dialogs (alert / confirm / prompt / beforeunload)
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def set_dialog_handler(
+    session_id: str,
+    ctx: Context,
+    action: str = "accept",
+    prompt_text: str = "",
+) -> Dict[str, Any]:
+    """Set how JS dialogs are auto-handled for this session.
+
+    A dialog (``alert``/``confirm``/``prompt``/``beforeunload``) blocks the page
+    until answered, so it can't be surfaced to you mid-action — this sets the
+    policy applied automatically to every tab. ``action`` is ``accept`` (default:
+    OK / Leave / submit ``prompt_text``) or ``dismiss`` (Cancel / Stay). Inspect
+    what actually fired with ``get_dialogs``."""
+    action = (action or "").lower()
+    if action not in ("accept", "dismiss"):
+        return _err("action must be 'accept' or 'dismiss'")
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        s.dialog_action = action
+        s.dialog_prompt_text = prompt_text
+        return _ok(action=action, prompt_text=prompt_text)
+
+
+@mcp.tool()
+async def get_dialogs(session_id: str, ctx: Context, clear: bool = False) -> Dict[str, Any]:
+    """Return JS dialogs seen this session (type, message, default_value, action taken).
+
+    Set ``clear=True`` to also empty the log."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        out = list(s.dialog_log)
+        if clear:
+            s.dialog_log.clear()
+        return _ok(dialogs=out, count=len(out))
+
+
+# --------------------------------------------------------------------------- #
+# Popups / new tabs
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def wait_for_page(
+    session_id: str,
+    ctx: Context,
+    known_page_ids: Optional[List[int]] = None,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Wait for a new tab/window (popup) to open, e.g. after an OAuth ``click``.
+
+    New tabs (``window.open`` / ``target=_blank`` / OAuth popups) are adopted
+    automatically; this waits until one appears and returns the new ``page_id``(s).
+    Then ``switch_page`` to it. Because a popup may be adopted *before* this call,
+    pass the page ids you already had (``known_page_ids``, e.g. from ``list_pages``
+    before the click) so an already-open popup is returned immediately; otherwise
+    the current pages form the baseline and only strictly-new tabs are reported."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        baseline = set(known_page_ids) if known_page_ids is not None else set(s.pages.keys())
+        while True:
+            new = [pid for pid in s.pages.keys() if pid not in baseline]
+            if new:
+                return _ok(new_page_ids=sorted(new), active_page_id=s.active_page_id)
+            if s.closed:
+                return _err("session closed")
+            if loop.time() >= deadline:
+                return _err("wait_for_page timed out")
+            await asyncio.sleep(0.15)
+
+
+# --------------------------------------------------------------------------- #
+# Cookies & storage state
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def get_cookies(
+    session_id: str,
+    ctx: Context,
+    urls: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return the context's cookies, optionally filtered to ``urls``."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        c = _context_of(s)
+        if c is None:
+            return _err("no browser context available")
+        try:
+            cookies = await c.cookies(urls)
+        except Exception as exc:
+            return _pw_err(s, "get_cookies", exc)
+        return _ok(cookies=list(cookies), count=len(cookies))
+
+
+@mcp.tool()
+async def add_cookies(
+    session_id: str,
+    cookies: List[Dict[str, Any]],
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Add cookies to the context (affects all tabs).
+
+    Each cookie needs ``name`` + ``value`` and either ``url`` or (``domain`` +
+    ``path``). Useful to inject a login state for debugging."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        c = _context_of(s)
+        if c is None:
+            return _err("no browser context available")
+        try:
+            await c.add_cookies(list(cookies))
+        except Exception as exc:
+            return _pw_err(s, "add_cookies", exc)
+        return _ok(added=len(cookies))
+
+
+@mcp.tool()
+async def clear_cookies(session_id: str, ctx: Context) -> Dict[str, Any]:
+    """Clear all cookies in the context."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        c = _context_of(s)
+        if c is None:
+            return _err("no browser context available")
+        try:
+            await c.clear_cookies()
+        except Exception as exc:
+            return _pw_err(s, "clear_cookies", exc)
+        return _ok(cleared=True)
+
+
+@mcp.tool()
+async def save_storage_state(session_id: str, path: str, ctx: Context) -> Dict[str, Any]:
+    """Save the context's cookies + localStorage to a JSON file at ``path``.
+
+    Reload it in a future session via ``start_session(storage_state_path=...)`` to
+    resume a logged-in state without re-authenticating (non-persistent sessions)."""
+    try:
+        s = await _get_session(session_id)
+    except KeyError as exc:
+        return _err(str(exc))
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        c = _context_of(s)
+        if c is None:
+            return _err("no browser context available")
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            await c.storage_state(path=path)
+        except Exception as exc:
+            return _pw_err(s, "save_storage_state", exc)
+        return _ok(path=path)
+
+
+# --------------------------------------------------------------------------- #
+# Frames (iframe access)
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def list_frames(session_id: str, ctx: Context) -> Dict[str, Any]:
+    """List the page's top-level ``<iframe>`` elements with a ready-to-use selector.
+
+    Each entry: index, id, name, src, and ``suggested_selector`` to pass as the
+    ``frame_selector`` of the ``frame_*`` tools. For nested iframes, chain
+    selectors with ``>>>`` (e.g. ``"iframe#outer >>> iframe.inner"``)."""
+    js = """
+    () => Array.from(document.querySelectorAll('iframe')).map((e, i) => {
+      let sel;
+      if (e.id) sel = 'iframe#' + CSS.escape(e.id);
+      else if (e.getAttribute('name')) sel = 'iframe[name="' + e.getAttribute('name') + '"]';
+      else if (e.getAttribute('src')) sel = 'iframe[src="' + e.getAttribute('src') + '"]';
+      else sel = 'iframe:nth-of-type(' + (i + 1) + ')';
+      return { index: i, id: e.id || null, name: e.getAttribute('name'),
+               src: e.getAttribute('src'), suggested_selector: sel };
+    })
+    """
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                data = await page.evaluate(js)
+            except Exception as exc:
+                return _pw_err(s, "list_frames", exc)
+            return _ok(count=len(data), frames=data)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_click(
+    session_id: str,
+    frame_selector: str,
+    selector: str,
+    ctx: Context,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Click ``selector`` inside the iframe addressed by ``frame_selector``.
+
+    ``frame_selector`` is a CSS selector for the ``<iframe>`` (chain nested frames
+    with ``>>>``); discover it via ``list_frames``. Ideal for reCAPTCHA checkboxes
+    and payment widgets living in cross-origin frames."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await _frame_locator(page, frame_selector).locator(selector).click(timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "frame_click", exc)
+            return _ok(frame_selector=frame_selector, selector=selector)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_fill(
+    session_id: str,
+    frame_selector: str,
+    selector: str,
+    value: str,
+    ctx: Context,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Clear and fill ``selector`` inside the iframe ``frame_selector`` with ``value``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                await _frame_locator(page, frame_selector).locator(selector).fill(value, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "frame_fill", exc)
+            return _ok(frame_selector=frame_selector, selector=selector)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_type(
+    session_id: str,
+    frame_selector: str,
+    selector: str,
+    text: str,
+    ctx: Context,
+    delay_ms: int = 0,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Type ``text`` key-by-key into ``selector`` inside the iframe ``frame_selector``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                loc = _frame_locator(page, frame_selector).locator(selector)
+                await loc.type(text, delay=delay_ms, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "frame_type", exc)
+            return _ok(frame_selector=frame_selector, selector=selector, length=len(text))
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_get_text(
+    session_id: str,
+    frame_selector: str,
+    ctx: Context,
+    selector: str = "body",
+    max_chars: int = 20000,
+) -> Dict[str, Any]:
+    """Get inner text of ``selector`` inside the iframe ``frame_selector``.
+
+    Defaults to the frame's whole ``body``. Output is capped to ``max_chars``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                loc = _frame_locator(page, frame_selector).locator(selector)
+                text = await loc.first.inner_text()
+            except Exception as exc:
+                return _pw_err(s, "frame_get_text", exc)
+            truncated = len(text) > max_chars
+            return _ok(text=text[:max_chars], truncated=truncated, full_length=len(text))
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_wait_for_selector(
+    session_id: str,
+    frame_selector: str,
+    selector: str,
+    ctx: Context,
+    timeout_ms: int = 30000,
+    state: str = "visible",
+) -> Dict[str, Any]:
+    """Wait until ``selector`` inside the iframe ``frame_selector`` reaches ``state``.
+
+    ``state``: ``visible`` | ``hidden`` | ``attached`` | ``detached``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                loc = _frame_locator(page, frame_selector).locator(selector)
+                await loc.first.wait_for(timeout=timeout_ms, state=state)
+            except Exception as exc:
+                return _pw_err(s, "frame_wait_for_selector", exc)
+            return _ok(frame_selector=frame_selector, selector=selector, state=state)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_query_elements(
+    session_id: str,
+    frame_selector: str,
+    selector: str,
+    ctx: Context,
+    max_results: int = 50,
+) -> Dict[str, Any]:
+    """Structured snapshot of elements matching ``selector`` INSIDE an iframe.
+
+    Same shape as ``query_elements`` but frame-aware (the page-level version can't
+    see into iframes). ``frame_selector`` is the iframe CSS selector chain
+    (``>>>`` for nesting); the frames must already be present on the page."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                frame = await _resolve_frame(page, frame_selector)
+                data = await frame.evaluate(_QUERY_ELEMENTS_JS, {"sel": selector, "limit": max_results})
+            except Exception as exc:
+                return _pw_err(s, "frame_query_elements", exc)
+            return _ok(frame_selector=frame_selector, selector=selector, count=len(data), elements=data)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
