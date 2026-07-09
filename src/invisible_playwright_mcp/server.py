@@ -468,7 +468,18 @@ async def start_session(
     Parameters
     ----------
     seed : int, optional
-        Reproducible fingerprint. Random per session when omitted.
+        Reproducible fingerprint. Random per session when omitted. NOTE: the
+        render-noise seed pool is calibrated on one GPU family and is NOT
+        host-independent, so a random seed has a meaningful chance (~40% on a
+        QEMU virtual GPU vs. Fingerprint Pro) of producing a "dirty" canvas/WebGL
+        hash that strict detectors flag as tampering. For best results pass an
+        explicit seed you have pre-validated on the deployment host (screen a
+        small range, e.g. 1-50, against your target detector and keep the ones
+        with low tampering_ml / anti_detect=false). Which seeds are clean
+        depends on the host GPU — do not assume a seed good on one machine is
+        good on another. On the tested host (Linux + QEMU virtual GPU) seeds
+        12, 15, 21, 25 scored lowest; the returned ``seed`` is logged for
+        replay, so record a good one and reuse it.
     headless : bool
         On Windows/macOS the patched binary self-cloaks its window.
     proxy_server : str
