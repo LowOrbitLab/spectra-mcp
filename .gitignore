@@ -1,0 +1,6 @@
+AGENTS.md
+
+# Python
+__pycache__/
+*.egg-info/
+*.pyc

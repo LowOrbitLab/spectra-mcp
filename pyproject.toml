@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "invisible-playwright-mcp"
+version = "0.1.0"
+description = "MCP server that exposes the invisible_playwright anti-detect browser to LLMs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "opencode" }]
+keywords = ["mcp", "playwright", "anti-detect", "browser-automation", "scraping"]
+dependencies = [
+    "mcp>=1.2",
+    "invisible-playwright>=0.3.0",
+    "anyio>=4",
+]
+
+[project.scripts]
+invisible-playwright-mcp = "invisible_playwright_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
