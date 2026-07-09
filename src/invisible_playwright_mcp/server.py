@@ -56,7 +56,9 @@ class _Session:
     browser_or_ctx: Any  # playwright.async_api.Browser | BrowserContext
     seed: int
     persistent: bool
-    contexts: List[Any] = field(default_factory=list)  # contexts we created (Browser path)
+    primary_context: Any = None  # cached shared BrowserContext (Browser path only)
+    contexts: List[Any] = field(default_factory=list)  # contexts to close on teardown
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # lifecycle guard (close-vs-inflight)
     pages: Dict[int, Any] = field(default_factory=dict)  # page_id -> Page
     next_page_id: int = 1
     active_page_id: Optional[int] = None
@@ -65,6 +67,12 @@ class _Session:
 
 _SESSIONS: Dict[str, _Session] = {}
 _LOCK = asyncio.Lock()
+
+# How long _close_session waits for an in-flight tool to finish before
+# force-closing pages. Long Playwright calls (e.g. goto with a big timeout)
+# that don't yield within this window get force-closed; their tool's except
+# block sees s.closed=True and returns a clean _err("session closed").
+_CLOSE_DRAIN_TIMEOUT = 5.0
 
 
 def _ok(**kw: Any) -> Dict[str, Any]:
@@ -98,16 +106,25 @@ def _active_page(session: _Session) -> Any:
 
 
 async def _make_page(session: _Session) -> Any:
-    """Create a new page, honouring the patched new_context defaults."""
+    """Create a new page (real tab) in the session's shared BrowserContext.
+
+    On the Browser path the first call creates the (patched) BrowserContext and
+    caches it on the session; subsequent calls open pages in that same context,
+    so all pages share cookies/storage — matching the persistent path and real
+    browser tab behaviour. The patched ``new_context()`` injects fingerprint
+    viewport/screen/timezone/locale defaults once, at context creation.
+    """
     boc = session.browser_or_ctx
     if hasattr(boc, "new_context"):
-        # Browser path: new_context() is patched by InvisiblePlaywright to
-        # inject fingerprint viewport/screen/timezone/locale defaults.
-        ctx = await boc.new_context()
-        session.contexts.append(ctx)
+        if session.primary_context is None:
+            ctx = await boc.new_context()
+            session.primary_context = ctx
+            session.contexts.append(ctx)
+        else:
+            ctx = session.primary_context
         page = await ctx.new_page()
     else:
-        # Persistent BrowserContext path.
+        # Persistent BrowserContext path: new_page() shares the single context.
         page = await boc.new_page()
     pid = session.next_page_id
     session.next_page_id += 1
@@ -119,24 +136,40 @@ async def _make_page(session: _Session) -> Any:
 async def _close_session(session: _Session) -> None:
     if session.closed:
         return
-    for page in list(session.pages.values()):
-        try:
-            if not page.is_closed():
-                await page.close()
-        except Exception:
-            pass
-    for ctx in session.contexts:
-        try:
-            await ctx.close()
-        except Exception:
-            pass
-    session.contexts.clear()
-    session.pages.clear()
-    try:
-        await session.ipw.__aexit__(None, None, None)
-    except Exception as exc:
-        _log.warning("error tearing down session %s: %s", session.session_id, exc)
+    # Set closed=True BEFORE closing pages so that in-flight tools force-closed
+    # mid-Playwright-call see s.closed=True in their except and return a clean
+    # _err("session closed") instead of raw Playwright noise.
     session.closed = True
+    got_lock = False
+    try:
+        await asyncio.wait_for(session.lock.acquire(), timeout=_CLOSE_DRAIN_TIMEOUT)
+        got_lock = True
+    except asyncio.TimeoutError:
+        _log.warning(
+            "close_session %s: in-flight tool did not yield within %.1fs; force-closing",
+            session.session_id, _CLOSE_DRAIN_TIMEOUT,
+        )
+    try:
+        for page in list(session.pages.values()):
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+        for ctx in session.contexts:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        session.contexts.clear()
+        session.pages.clear()
+        try:
+            await session.ipw.__aexit__(None, None, None)
+        except Exception as exc:
+            _log.warning("error tearing down session %s: %s", session.session_id, exc)
+    finally:
+        if got_lock:
+            session.lock.release()
 
 
 async def _close_all_sessions() -> None:
@@ -191,8 +224,10 @@ async def fetch_binary(force: bool = False, ctx: Context = None) -> Dict[str, An
     """Download (and verify) the patched Firefox binary if not already cached.
 
     One-time ~100 MB download, SHA256-verified. Set ``force=True`` to re-download
-    even if a cached copy exists. Call this before ``start_session``. May take
-    tens of seconds on a cold cache.
+    even if a cached copy exists. Call this before ``start_session``. Reports
+    download progress (0-100%) when the server reports a size and the client
+    supports progress tokens; phase changes (downloading/verifying/extracting)
+    are always logged.
     """
     import shutil
 
@@ -201,15 +236,40 @@ async def fetch_binary(force: bool = False, ctx: Context = None) -> Dict[str, An
         await ctx.info("force: removing existing cache dir")
         await asyncio.to_thread(shutil.rmtree, str(vdir), True)
 
+    loop = asyncio.get_running_loop()
+
+    # progress/status run on the asyncio.to_thread worker thread and cannot
+    # await ctx directly. Bridge each notification back to the event loop with
+    # run_coroutine_threadsafe (fire-and-forget: we never .result(), so the
+    # download thread never blocks on the MCP client). A done-callback retrieves
+    # any exception so a client disconnect mid-download doesn't surface as an
+    # "exception never retrieved" warning.
+    def _emit(coro):
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        fut.add_done_callback(
+            lambda f: _log.debug("progress emit failed: %s", f.exception())
+            if (not f.cancelled() and f.exception() is not None)
+            else None
+        )
+
+    last_pct = -1
+
+    def _progress(done: int, total: int) -> None:
+        nonlocal last_pct
+        if total <= 0:
+            return
+        pct = round(done * 100 / total)
+        if pct == last_pct:
+            return
+        last_pct = pct
+        _emit(ctx.report_progress(float(pct), 100.0, f"downloading {pct}%"))
+
     def _status(phase: str) -> None:
         _log.info("fetch_binary phase=%s", phase)
-        try:
-            asyncio.get_event_loop()  # no-op; keep logger path
-        except Exception:
-            pass
+        _emit(ctx.report_progress(0.0, None, phase))
 
     await ctx.info("ensuring patched Firefox binary (may download ~100 MB)")
-    path = await asyncio.to_thread(ensure_binary, BINARY_VERSION, None, _status)
+    path = await asyncio.to_thread(ensure_binary, BINARY_VERSION, _progress, _status)
     await ctx.info(f"binary ready at {path}")
     return _ok(path=str(path), version=BINARY_VERSION, cache_root=str(cache_root()))
 
@@ -354,19 +414,22 @@ async def session_info(session_id: str, ctx: Context) -> Dict[str, Any]:
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
-    pages_info = []
-    for pid, page in s.pages.items():
-        try:
-            pages_info.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
-        except Exception:
-            pages_info.append({"page_id": pid, "url": None, "closed": True})
-    return _ok(
-        session_id=s.session_id,
-        seed=s.seed,
-        persistent=s.persistent,
-        active_page_id=s.active_page_id,
-        pages=pages_info,
-    )
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        pages_info = []
+        for pid, page in s.pages.items():
+            try:
+                pages_info.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
+            except Exception:
+                pages_info.append({"page_id": pid, "url": None, "closed": True})
+        return _ok(
+            session_id=s.session_id,
+            seed=s.seed,
+            persistent=s.persistent,
+            active_page_id=s.active_page_id,
+            pages=pages_info,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -381,11 +444,14 @@ async def new_page(session_id: str, ctx: Context = None) -> Dict[str, Any]:
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
-    try:
-        page, pid = await _make_page(s)
-    except Exception as exc:
-        return _err(f"new_page failed: {exc}")
-    return _ok(page_id=pid, url=page.url)
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        try:
+            page, pid = await _make_page(s)
+        except Exception as exc:
+            return _pw_err(s, "new_page", exc)
+        return _ok(page_id=pid, url=page.url)
 
 
 @mcp.tool()
@@ -395,20 +461,23 @@ async def close_page(session_id: str, page_id: Optional[int] = None, ctx: Contex
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
-    target = page_id if page_id is not None else s.active_page_id
-    if target is None:
-        return _err("no page to close")
-    page = s.pages.pop(target, None)
-    if page is None:
-        return _err(f"unknown page_id: {target}")
-    try:
-        if not page.is_closed():
-            await page.close()
-    except Exception as exc:
-        return _err(f"close_page failed: {exc}")
-    if s.active_page_id == target:
-        s.active_page_id = next(iter(s.pages), None)
-    return _ok(closed_page_id=target, active_page_id=s.active_page_id)
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        target = page_id if page_id is not None else s.active_page_id
+        if target is None:
+            return _err("no page to close")
+        page = s.pages.pop(target, None)
+        if page is None:
+            return _err(f"unknown page_id: {target}")
+        try:
+            if not page.is_closed():
+                await page.close()
+        except Exception as exc:
+            return _pw_err(s, "close_page", exc)
+        if s.active_page_id == target:
+            s.active_page_id = next(iter(s.pages), None)
+        return _ok(closed_page_id=target, active_page_id=s.active_page_id)
 
 
 @mcp.tool()
@@ -418,12 +487,15 @@ async def switch_page(session_id: str, page_id: int, ctx: Context = None) -> Dic
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
-    if page_id not in s.pages:
-        return _err(f"unknown page_id: {page_id}")
-    if s.pages[page_id].is_closed():
-        return _err(f"page {page_id} is closed")
-    s.active_page_id = page_id
-    return _ok(active_page_id=page_id, url=s.pages[page_id].url)
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        if page_id not in s.pages:
+            return _err(f"unknown page_id: {page_id}")
+        if s.pages[page_id].is_closed():
+            return _err(f"page {page_id} is closed")
+        s.active_page_id = page_id
+        return _ok(active_page_id=page_id, url=s.pages[page_id].url)
 
 
 @mcp.tool()
@@ -433,13 +505,16 @@ async def list_pages(session_id: str, ctx: Context) -> Dict[str, Any]:
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
-    pages = []
-    for pid, page in s.pages.items():
-        try:
-            pages.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
-        except Exception:
-            pages.append({"page_id": pid, "url": None, "closed": True})
-    return _ok(active_page_id=s.active_page_id, pages=pages)
+    async with s.lock:
+        if s.closed:
+            return _err("session closed")
+        pages = []
+        for pid, page in s.pages.items():
+            try:
+                pages.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
+            except Exception:
+                pages.append({"page_id": pid, "url": None, "closed": True})
+        return _ok(active_page_id=s.active_page_id, pages=pages)
 
 
 # --------------------------------------------------------------------------- #
@@ -447,9 +522,30 @@ async def list_pages(session_id: str, ctx: Context) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-async def _resolve_page(session_id: str) -> Any:
+@asynccontextmanager
+async def _use_page(session_id: str):
+    """Resolve the session + active page under the session lock.
+
+    Acquires ``s.lock``, checks ``s.closed``, and yields ``(s, page)``. The lock
+    is held until the ``async with`` block exits — this is the lifecycle guard
+    that lets ``_close_session`` drain in-flight tools before force-closing.
+    Raises ``KeyError`` (unknown session) or ``RuntimeError`` (session closed /
+    no active page); callers catch both and return ``_err(str(exc))``.
+    """
     s = await _get_session(session_id)
-    return _active_page(s)
+    async with s.lock:
+        if s.closed:
+            raise RuntimeError("session closed")
+        yield s, _active_page(s)
+
+
+def _pw_err(s: _Session, what: str, exc: Exception) -> Dict[str, Any]:
+    """Error from a Playwright call. Returns a clean ``session closed`` if the
+    session was closed (e.g. force-closed by ``_close_session`` mid-call);
+    otherwise the raw Playwright error message."""
+    if s.closed:
+        return _err("session closed")
+    return _err(f"{what} failed: {exc}")
 
 
 @mcp.tool()
@@ -465,55 +561,55 @@ async def goto(
     ``wait_until``: ``load`` | ``domcontentloaded`` | ``networkidle`` | ``commit``.
     """
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                resp = await page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+            except Exception as exc:
+                return _pw_err(s, "goto", exc)
+            status = resp.status if resp is not None else None
+            return _ok(url=page.url, status=status, title=await page.title())
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        resp = await page.goto(url, timeout=timeout_ms, wait_until=wait_until)
-    except Exception as exc:
-        return _err(f"goto failed: {exc}")
-    status = resp.status if resp is not None else None
-    return _ok(url=page.url, status=status, title=await page.title())
 
 
 @mcp.tool()
 async def go_back(session_id: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                ok = await page.go_back(timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "go_back", exc)
+            return _ok(url=page.url, navigated=bool(ok))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        ok = await page.go_back(timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"go_back failed: {exc}")
-    return _ok(url=page.url, navigated=bool(ok))
 
 
 @mcp.tool()
 async def go_forward(session_id: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                ok = await page.go_forward(timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "go_forward", exc)
+            return _ok(url=page.url, navigated=bool(ok))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        ok = await page.go_forward(timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"go_forward failed: {exc}")
-    return _ok(url=page.url, navigated=bool(ok))
 
 
 @mcp.tool()
 async def reload(session_id: str, timeout_ms: int = 30000, wait_until: str = "load", ctx: Context = None) -> Dict[str, Any]:
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                resp = await page.reload(timeout=timeout_ms, wait_until=wait_until)
+            except Exception as exc:
+                return _pw_err(s, "reload", exc)
+            status = resp.status if resp is not None else None
+            return _ok(url=page.url, status=status)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        resp = await page.reload(timeout=timeout_ms, wait_until=wait_until)
-    except Exception as exc:
-        return _err(f"reload failed: {exc}")
-    status = resp.status if resp is not None else None
-    return _ok(url=page.url, status=status)
 
 
 # --------------------------------------------------------------------------- #
@@ -532,14 +628,14 @@ async def click(
 ) -> Dict[str, Any]:
     """Click an element matched by ``selector`` (humanized Bezier mouse path)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.click(selector, timeout=timeout_ms, button=button, click_count=click_count)
+            except Exception as exc:
+                return _pw_err(s, "click", exc)
+            return _ok(selector=selector)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.click(selector, timeout=timeout_ms, button=button, click_count=click_count)
-    except Exception as exc:
-        return _err(f"click failed: {exc}")
-    return _ok(selector=selector)
 
 
 @mcp.tool()
@@ -552,14 +648,14 @@ async def fill(
 ) -> Dict[str, Any]:
     """Clear and fill an input/textarea with ``value`` (atomic, not per-keystroke)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.fill(selector, value, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "fill", exc)
+            return _ok(selector=selector, value=value)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.fill(selector, value, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"fill failed: {exc}")
-    return _ok(selector=selector, value=value)
 
 
 @mcp.tool()
@@ -573,14 +669,14 @@ async def type_text(
 ) -> Dict[str, Any]:
     """Type ``text`` into an element one keystroke at a time (use for key-by-key input)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.type(selector, text, delay=delay_ms, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "type", exc)
+            return _ok(selector=selector, length=len(text))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.type(selector, text, delay=delay_ms, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"type failed: {exc}")
-    return _ok(selector=selector, length=len(text))
 
 
 @mcp.tool()
@@ -593,28 +689,28 @@ async def press_key(
 ) -> Dict[str, Any]:
     """Focus ``selector`` and press a keyboard ``key`` (e.g. ``Enter``, ``Tab``, ``ArrowDown``)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.press(selector, key, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "press_key", exc)
+            return _ok(selector=selector, key=key)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.press(selector, key, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"press_key failed: {exc}")
-    return _ok(selector=selector, key=key)
 
 
 @mcp.tool()
 async def keyboard_press(session_id: str, key: str, ctx: Context = None) -> Dict[str, Any]:
     """Press a keyboard ``key`` on the focused element (no selector)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.keyboard.press(key)
+            except Exception as exc:
+                return _pw_err(s, "keyboard_press", exc)
+            return _ok(key=key)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.keyboard.press(key)
-    except Exception as exc:
-        return _err(f"keyboard_press failed: {exc}")
-    return _ok(key=key)
 
 
 @mcp.tool()
@@ -627,14 +723,14 @@ async def select_option(
 ) -> Dict[str, Any]:
     """Select an ``<option>`` by value in a ``<select>``."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                selected = await page.select_option(selector, value, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "select_option", exc)
+            return _ok(selector=selector, selected=list(selected))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        selected = await page.select_option(selector, value, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"select_option failed: {exc}")
-    return _ok(selector=selector, selected=list(selected))
 
 
 @mcp.tool()
@@ -646,55 +742,55 @@ async def hover(
 ) -> Dict[str, Any]:
     """Hover an element (humanized mouse path)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.hover(selector, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "hover", exc)
+            return _ok(selector=selector)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.hover(selector, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"hover failed: {exc}")
-    return _ok(selector=selector)
 
 
 @mcp.tool()
 async def focus(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.focus(selector, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "focus", exc)
+            return _ok(selector=selector)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.focus(selector, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"focus failed: {exc}")
-    return _ok(selector=selector)
 
 
 @mcp.tool()
 async def check(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
     """Check a checkbox/radio matched by ``selector``."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.check(selector, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "check", exc)
+            return _ok(selector=selector)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.check(selector, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"check failed: {exc}")
-    return _ok(selector=selector)
 
 
 @mcp.tool()
 async def uncheck(session_id: str, selector: str, timeout_ms: int = 30000, ctx: Context = None) -> Dict[str, Any]:
     """Uncheck a checkbox matched by ``selector``."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.uncheck(selector, timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "uncheck", exc)
+            return _ok(selector=selector)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        await page.uncheck(selector, timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"uncheck failed: {exc}")
-    return _ok(selector=selector)
 
 
 @mcp.tool()
@@ -707,18 +803,18 @@ async def scroll(
 ) -> Dict[str, Any]:
     """Scroll the page by (dx, dy) pixels. If ``selector`` is given, scroll that element into view first."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                if selector:
+                    el = await page.query_selector(selector)
+                    if el is not None:
+                        await el.scroll_into_view_if_needed()
+                await page.mouse.wheel(dx, dy)
+            except Exception as exc:
+                return _pw_err(s, "scroll", exc)
+            return _ok(dx=dx, dy=dy)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        if selector:
-            el = await page.query_selector(selector)
-            if el is not None:
-                await el.scroll_into_view_if_needed()
-        await page.mouse.wheel(dx, dy)
-    except Exception as exc:
-        return _err(f"scroll failed: {exc}")
-    return _ok(dx=dx, dy=dy)
 
 
 # --------------------------------------------------------------------------- #
@@ -729,23 +825,23 @@ async def scroll(
 @mcp.tool()
 async def get_url(session_id: str, ctx: Context = None) -> Dict[str, Any]:
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            return _ok(url=page.url)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    return _ok(url=page.url)
 
 
 @mcp.tool()
 async def get_title(session_id: str, ctx: Context = None) -> Dict[str, Any]:
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                title = await page.title()
+            except Exception as exc:
+                return _pw_err(s, "get_title", exc)
+            return _ok(title=title)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        title = await page.title()
-    except Exception as exc:
-        return _err(f"get_title failed: {exc}")
-    return _ok(title=title)
 
 
 @mcp.tool()
@@ -757,21 +853,21 @@ async def get_text(
 ) -> Dict[str, Any]:
     """Get visible text. Empty ``selector`` = the whole body. Output is capped to ``max_chars``."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                if selector:
+                    el = await page.query_selector(selector)
+                    if el is None:
+                        return _err(f"no element matches {selector!r}")
+                    text = await el.inner_text()
+                else:
+                    text = await page.inner_text("body")
+            except Exception as exc:
+                return _pw_err(s, "get_text", exc)
+            truncated = len(text) > max_chars
+            return _ok(text=text[:max_chars], truncated=truncated, full_length=len(text))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        if selector:
-            el = await page.query_selector(selector)
-            if el is None:
-                return _err(f"no element matches {selector!r}")
-            text = await el.inner_text()
-        else:
-            text = await page.inner_text("body")
-    except Exception as exc:
-        return _err(f"get_text failed: {exc}")
-    truncated = len(text) > max_chars
-    return _ok(text=text[:max_chars], truncated=truncated, full_length=len(text))
 
 
 @mcp.tool()
@@ -783,20 +879,20 @@ async def get_html(
 ) -> Dict[str, Any]:
     """Get HTML. Empty ``selector`` = full document (``page.content()``). Capped to ``max_chars``."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                if selector:
+                    html = await page.eval_on_selector(
+                        selector, "el => el.outerHTML"
+                    )
+                else:
+                    html = await page.content()
+            except Exception as exc:
+                return _pw_err(s, "get_html", exc)
+            truncated = len(html) > max_chars
+            return _ok(html=html[:max_chars], truncated=truncated, full_length=len(html))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        if selector:
-            html = await page.eval_on_selector(
-                selector, "el => el.outerHTML"
-            )
-        else:
-            html = await page.content()
-    except Exception as exc:
-        return _err(f"get_html failed: {exc}")
-    truncated = len(html) > max_chars
-    return _ok(html=html[:max_chars], truncated=truncated, full_length=len(html))
 
 
 @mcp.tool()
@@ -808,14 +904,14 @@ async def get_attribute(
 ) -> Dict[str, Any]:
     """Return a single attribute of the first element matching ``selector``."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                val = await page.get_attribute(selector, attribute)
+            except Exception as exc:
+                return _pw_err(s, "get_attribute", exc)
+            return _ok(selector=selector, attribute=attribute, value=val)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        val = await page.get_attribute(selector, attribute)
-    except Exception as exc:
-        return _err(f"get_attribute failed: {exc}")
-    return _ok(selector=selector, attribute=attribute, value=val)
 
 
 @mcp.tool()
@@ -831,10 +927,6 @@ async def query_elements(
     placeholder, visible flag and bounding rect. Useful for the LLM to decide
     what to click next without scraping raw HTML.
     """
-    try:
-        page = await _resolve_page(session_id)
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
     js = """
     (params) => {
       const els = Array.from(document.querySelectorAll(params.sel)).slice(0, params.limit);
@@ -857,10 +949,14 @@ async def query_elements(
     }
     """
     try:
-        data = await page.evaluate(js, {"sel": selector, "limit": max_results})
-    except Exception as exc:
-        return _err(f"query_elements failed: {exc}")
-    return _ok(selector=selector, count=len(data), elements=data)
+        async with _use_page(session_id) as (s, page):
+            try:
+                data = await page.evaluate(js, {"sel": selector, "limit": max_results})
+            except Exception as exc:
+                return _pw_err(s, "query_elements", exc)
+            return _ok(selector=selector, count=len(data), elements=data)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
 
 
 @mcp.tool()
@@ -872,15 +968,15 @@ async def is_visible(
 ) -> Dict[str, Any]:
     """Check whether ``selector`` matches a visible element (with a short wait)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                loc = page.locator(selector)
+                visible = await loc.first.is_visible(timeout=timeout_ms)
+            except Exception as exc:
+                return _pw_err(s, "is_visible", exc)
+            return _ok(selector=selector, visible=bool(visible))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        loc = page.locator(selector)
-        visible = await loc.first.is_visible(timeout=timeout_ms)
-    except Exception as exc:
-        return _err(f"is_visible failed: {exc}")
-    return _ok(selector=selector, visible=bool(visible))
 
 
 # --------------------------------------------------------------------------- #
@@ -903,21 +999,21 @@ async def screenshot(
     captures the whole scrollable page.
     """
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            fmt = (image_format or "jpeg").lower()
+            try:
+                if fmt == "png":
+                    data = await page.screenshot(full_page=full_page, type="png")
+                    mime = "png"
+                else:
+                    data = await page.screenshot(full_page=full_page, type="jpeg", quality=quality)
+                    mime = "jpeg"
+            except Exception as exc:
+                raise RuntimeError("session closed" if s.closed else f"screenshot failed: {exc}") from exc
+            await ctx.debug(f"screenshot fmt={mime} full_page={full_page} bytes={len(data)}")
+            return Image(data=data, format=mime)
     except (KeyError, RuntimeError) as exc:
         raise RuntimeError(str(exc)) from exc
-    fmt = (image_format or "jpeg").lower()
-    try:
-        if fmt == "png":
-            data = await page.screenshot(full_page=full_page, type="png")
-            mime = "png"
-        else:
-            data = await page.screenshot(full_page=full_page, type="jpeg", quality=quality)
-            mime = "jpeg"
-    except Exception as exc:
-        raise RuntimeError(f"screenshot failed: {exc}") from exc
-    await ctx.debug(f"screenshot fmt={mime} full_page={full_page} bytes={len(data)}")
-    return Image(data=data, format=mime)
 
 
 # --------------------------------------------------------------------------- #
@@ -938,25 +1034,28 @@ async def wait_for_selector(
     ``state``: ``visible`` | ``hidden`` | ``attached`` | ``detached``.
     """
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                el = await page.wait_for_selector(selector, timeout=timeout_ms, state=state)
+            except Exception as exc:
+                return _pw_err(s, "wait_for_selector", exc)
+            return _ok(selector=selector, state=state, matched=el is not None)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        el = await page.wait_for_selector(selector, timeout=timeout_ms, state=state)
-    except Exception as exc:
-        return _err(f"wait_for_selector failed: {exc}")
-    return _ok(selector=selector, state=state, matched=el is not None)
 
 
 @mcp.tool()
 async def wait_for_timeout(session_id: str, ms: int, ctx: Context = None) -> Dict[str, Any]:
     """Sleep for ``ms`` milliseconds (used to let async page updates settle)."""
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                await page.wait_for_timeout(ms)
+            except Exception as exc:
+                return _pw_err(s, "wait_for_timeout", exc)
+            return _ok(ms=ms)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    await page.wait_for_timeout(ms)
-    return _ok(ms=ms)
 
 
 # --------------------------------------------------------------------------- #
@@ -978,18 +1077,18 @@ async def evaluate(
     The result is JSON-serialized. Use sparingly — arbitrary JS is powerful.
     """
     try:
-        page = await _resolve_page(session_id)
+        async with _use_page(session_id) as (s, page):
+            try:
+                result = await page.evaluate(script, arg)
+            except Exception as exc:
+                return _pw_err(s, "evaluate", exc)
+            try:
+                rendered = json.dumps(result, default=str, ensure_ascii=False)
+            except Exception:
+                rendered = str(result)
+            return _ok(result=rendered)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
-    try:
-        result = await page.evaluate(script, arg)
-    except Exception as exc:
-        return _err(f"evaluate failed: {exc}")
-    try:
-        rendered = json.dumps(result, default=str, ensure_ascii=False)
-    except Exception:
-        rendered = str(result)
-    return _ok(result=rendered)
 
 
 # --------------------------------------------------------------------------- #

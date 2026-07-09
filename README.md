@@ -191,6 +191,7 @@ use sparingly.
   if needed.
 - **`evaluate` runs arbitrary JS** — only enable for trusted use.
 - All logging goes to **stderr** so it never corrupts the stdio JSON-RPC stream.
+- Calls against a single session must be sequential (the natural LLM pattern: the model waits for each tool result before sending the next). Concurrent calls to one session are not supported.
 
 ---
 
