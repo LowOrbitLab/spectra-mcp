@@ -1694,6 +1694,8 @@ async def save_storage_state(session_id: str, path: str, ctx: Context) -> Dict[s
 
     Reload it in a future session via ``start_session(storage_state_path=...)`` to
     resume a logged-in state without re-authenticating (non-persistent sessions)."""
+    if not path:
+        return _err("path is required")
     try:
         s = await _get_session(session_id)
     except KeyError as exc:
@@ -1726,16 +1728,22 @@ async def list_frames(session_id: str, ctx: Context) -> Dict[str, Any]:
     Each entry: index, id, name, src, and ``suggested_selector`` to pass as the
     ``frame_selector`` of the ``frame_*`` tools. For nested iframes, chain
     selectors with ``>>>`` (e.g. ``"iframe#outer >>> iframe.inner"``)."""
-    js = """
-    () => Array.from(document.querySelectorAll('iframe')).map((e, i) => {
-      let sel;
-      if (e.id) sel = 'iframe#' + CSS.escape(e.id);
-      else if (e.getAttribute('name')) sel = 'iframe[name="' + e.getAttribute('name') + '"]';
-      else if (e.getAttribute('src')) sel = 'iframe[src="' + e.getAttribute('src') + '"]';
-      else sel = 'iframe:nth-of-type(' + (i + 1) + ')';
-      return { index: i, id: e.id || null, name: e.getAttribute('name'),
-               src: e.getAttribute('src'), suggested_selector: sel };
-    })
+    js = r"""
+    () => {
+      // Escape a value for use inside a double-quoted CSS attribute selector:
+      // backslash -> \\ and " -> \" . Without this, a name/src containing a
+      // double quote yields an invalid selector and every frame_* tool fails.
+      const escAttr = (s) => String(s).split('\\').join('\\\\').split('"').join('\\"');
+      return Array.from(document.querySelectorAll('iframe')).map((e, i) => {
+        let sel;
+        if (e.id) sel = 'iframe#' + CSS.escape(e.id);
+        else if (e.getAttribute('name')) sel = 'iframe[name="' + escAttr(e.getAttribute('name')) + '"]';
+        else if (e.getAttribute('src')) sel = 'iframe[src="' + escAttr(e.getAttribute('src')) + '"]';
+        else sel = 'iframe:nth-of-type(' + (i + 1) + ')';
+        return { index: i, id: e.id || null, name: e.getAttribute('name'),
+                 src: e.getAttribute('src'), suggested_selector: sel };
+      });
+    }
     """
     try:
         async with _use_page(session_id) as (s, page):
@@ -1885,6 +1893,103 @@ async def frame_query_elements(
             except Exception as exc:
                 return _pw_err(s, "frame_query_elements", exc)
             return _ok(frame_selector=frame_selector, selector=selector, count=len(data), elements=data)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_evaluate(
+    session_id: str,
+    frame_selector: str,
+    script: str,
+    ctx: Context,
+    arg: Any = None,
+    timeout_ms: int = 30000,
+) -> Dict[str, Any]:
+    """Execute arbitrary JavaScript INSIDE the iframe ``frame_selector`` and return its value.
+
+    Like ``evaluate`` but runs in the frame's realm — the page-level ``evaluate``
+    can't see into iframes, so use this to read cross-origin widget state (e.g. a
+    payment iframe's hidden token). ``script`` is evaluated as a function body
+    receiving ``arg``; e.g. ``() => document.title``.
+
+    ``timeout_ms`` bounds the server wait (Playwright has no native evaluate
+    timeout, so this is enforced via ``asyncio.wait_for``). On timeout the JS
+    keeps running in the frame and the frame may be left unresponsive — recover
+    with ``close_page`` + ``new_page``. Use sparingly.
+    """
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                frame = await _resolve_frame(page, frame_selector)
+                result = await asyncio.wait_for(
+                    frame.evaluate(script, arg), timeout=timeout_ms / 1000
+                )
+            except asyncio.TimeoutError:
+                return _err(
+                    f"frame_evaluate timed out after {timeout_ms}ms; "
+                    f"the frame may be unresponsive — close_page to recover"
+                )
+            except Exception as exc:
+                return _pw_err(s, "frame_evaluate", exc)
+            return _ok(result=result)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_get_html(
+    session_id: str,
+    frame_selector: str,
+    ctx: Context,
+    selector: str = "",
+    max_chars: int = 20000,
+) -> Dict[str, Any]:
+    """Get HTML inside the iframe ``frame_selector``.
+
+    Empty ``selector`` = the frame's full content (``frame.content()``);
+    otherwise the matched element's ``outerHTML``. Capped to ``max_chars``.
+    """
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                frame = await _resolve_frame(page, frame_selector)
+                if selector:
+                    html = await frame.eval_on_selector(selector, "el => el.outerHTML")
+                else:
+                    html = await frame.content()
+            except Exception as exc:
+                return _pw_err(s, "frame_get_html", exc)
+            truncated = len(html) > max_chars
+            return _ok(html=html[:max_chars], truncated=truncated, full_length=len(html))
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def frame_get_attribute(
+    session_id: str,
+    frame_selector: str,
+    selector: str,
+    attribute: str,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Return a single attribute of the first element matching ``selector`` inside the iframe ``frame_selector``."""
+    try:
+        async with _use_page(session_id) as (s, page):
+            try:
+                frame = await _resolve_frame(page, frame_selector)
+                val = await frame.eval_on_selector(
+                    selector, "(el, attr) => el.getAttribute(attr)", attribute
+                )
+            except Exception as exc:
+                return _pw_err(s, "frame_get_attribute", exc)
+            return _ok(
+                frame_selector=frame_selector,
+                selector=selector,
+                attribute=attribute,
+                value=val,
+            )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
