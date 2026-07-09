@@ -13,7 +13,6 @@ session.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import secrets
 import sys
@@ -1066,25 +1065,35 @@ async def evaluate(
     session_id: str,
     script: str,
     arg: Any = None,
+    timeout_ms: int = 30000,
     ctx: Context = None,
 ) -> Dict[str, Any]:
     """Execute arbitrary JavaScript in the active page and return its value.
 
     ``script`` is evaluated as an async function body receiving ``arg``:
     e.g. ``async (arg) => { return document.title; }`` or a plain expression.
-    The result is JSON-serialized. Use sparingly — arbitrary JS is powerful.
+
+    ``timeout_ms`` bounds how long the server waits for the script to return.
+    Playwright has no native evaluate timeout, so this is enforced via
+    ``asyncio.wait_for``. Note: on timeout the Python-side await is cancelled
+    but the JS keeps running in the browser — the page may be left
+    unresponsive (its main thread occupied). Call ``close_page`` then
+    ``new_page`` to recover. Use sparingly — arbitrary JS is powerful.
     """
     try:
         async with _use_page(session_id) as (s, page):
             try:
-                result = await page.evaluate(script, arg)
+                result = await asyncio.wait_for(
+                    page.evaluate(script, arg), timeout=timeout_ms / 1000
+                )
+            except asyncio.TimeoutError:
+                return _err(
+                    f"evaluate timed out after {timeout_ms}ms; "
+                    f"the page may be unresponsive — close_page to recover"
+                )
             except Exception as exc:
                 return _pw_err(s, "evaluate", exc)
-            try:
-                rendered = json.dumps(result, default=str, ensure_ascii=False)
-            except Exception:
-                rendered = str(result)
-            return _ok(result=rendered)
+            return _ok(result=result)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
