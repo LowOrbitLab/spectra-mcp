@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server that exposes
 [`invisible_playwright`](https://github.com/feder-cr/invisible_playwright) — an
-anti-detect Firefox that passes every bot-detection test — to LLMs.
+anti-detect Firefox with patched fingerprint surfaces — to LLMs.
 
 Your assistant can launch a fingerprint-randomized browser, navigate, click,
 type, read the DOM, and take screenshots through it, using the standard
@@ -161,6 +161,40 @@ click without scraping raw HTML.
 `evaluate` — run arbitrary JavaScript in the page and return its value. Powerful;
 use sparingly.
 
+### Coordinate mouse
+`mouse_drag`, `mouse_move`, `mouse_click`
+
+`mouse_drag` is intended for sliders, canvas handles and similar coordinate-based
+controls. With the current `firefox-15` patched binary, hold-drag requires a
+session started with `humanize=False`.
+
+### Focused keyboard
+`keyboard_down`, `keyboard_up`, `keyboard_type`
+
+Use `keyboard_down` / `keyboard_up` for modifier-key combinations. Always release
+keys that were explicitly held.
+
+### Dialogs and popups
+`set_dialog_handler`, `get_dialogs`, `wait_for_page`
+
+Dialogs are handled automatically according to the session policy so they cannot
+freeze an in-flight action. Popups are adopted into the session without changing
+the active page.
+
+### Cookies and storage state
+`get_cookies`, `add_cookies`, `clear_cookies`, `save_storage_state`
+
+Storage state contains cookies and localStorage. Treat saved files as secrets and
+resume them with `start_session(storage_state_path=...)`.
+
+### Frames
+`list_frames`, `frame_click`, `frame_fill`, `frame_type`, `frame_get_text`,
+`frame_wait_for_selector`, `frame_query_elements`, `frame_evaluate`,
+`frame_get_html`, `frame_get_attribute`
+
+`list_frames` returns a unique selector for each top-level iframe. Chain selectors
+with `>>>` to address nested iframes.
+
 ---
 
 ## `start_session` parameters
@@ -176,6 +210,7 @@ use sparingly.
 | `humanize` | `true` | Bezier mouse paths + human timing. |
 | `profile_dir` | `""` | Persistent profile path (enables persistent context). |
 | `prep_recaptcha` | `false` | Pre-seed reCAPTCHA cookies (non-persistent only). |
+| `storage_state_path` | `""` | JSON file created by `save_storage_state`; cannot be combined with `profile_dir`. |
 
 ---
 
@@ -187,9 +222,25 @@ use sparingly.
   download the binary if you skipped `fetch_binary`).
 - **Humanized clicks are slower** than vanilla Playwright — raise `timeout_ms`
   if needed.
+- **Coordinate hold-drag requires `humanize=False`** on the current patched
+  Firefox build.
+- File chooser, browser download events, selector drag-and-drop and back
+  navigation are intentionally not exposed because `firefox-15` does not
+  support them reliably. Use `evaluate`-based workflows when appropriate.
 - **`evaluate` runs arbitrary JS** — only enable for trusted use.
 - All logging goes to **stderr** so it never corrupts the stdio JSON-RPC stream.
 - Calls against a single session must be sequential (the natural LLM pattern: the model waits for each tool result before sending the next). Concurrent calls to one session are not supported.
+
+---
+
+## Development checks
+
+The regression suite uses only Python's standard library:
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q src tests
+```
 
 ---
 

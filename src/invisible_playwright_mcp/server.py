@@ -23,6 +23,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import Context, FastMCP, Image
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 # invisible_playwright ships an async façade that is a drop-in for the
 # Playwright async API and returns a standard playwright Browser/BrowserContext.
@@ -43,6 +44,7 @@ if not _log.handlers:
     _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     _log.addHandler(_h)
     _log.setLevel(logging.INFO)
+_log.propagate = False
 
 
 # --------------------------------------------------------------------------- #
@@ -74,12 +76,16 @@ class _Session:
 
 _SESSIONS: Dict[str, _Session] = {}
 _LOCK = asyncio.Lock()
+_BINARY_LOCK = asyncio.Lock()
 
 # How long _close_session waits for an in-flight tool to finish before
 # force-closing pages. Long Playwright calls (e.g. goto with a big timeout)
 # that don't yield within this window get force-closed; their tool's except
 # block sees s.closed=True and returns a clean _err("session closed").
 _CLOSE_DRAIN_TIMEOUT = 5.0
+
+# 单个 Playwright 清理动作的最长等待时间，防止服务退出永久卡住。
+_CLEANUP_TIMEOUT = 10.0
 
 # Max JS dialogs retained per session in _Session.dialog_log (newest kept).
 _DIALOG_CAP = 50
@@ -122,6 +128,7 @@ _QUERY_ELEMENTS_JS = """
   const els = Array.from(document.querySelectorAll(params.sel)).slice(0, params.limit);
   return els.map(e => {
     const r = e.getBoundingClientRect();
+    const style = getComputedStyle(e);
     return {
       tag: e.tagName.toLowerCase(),
       id: e.id || null,
@@ -132,7 +139,7 @@ _QUERY_ELEMENTS_JS = """
       value: ('value' in e) ? e.value : null,
       placeholder: e.getAttribute('placeholder'),
       text: (e.innerText || '').slice(0, 200),
-      visible: !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length),
+      visible: style.visibility === 'visible' && !!(r.width || r.height),
       rect: { x: r.x, y: r.y, w: r.width, h: r.height }
     };
   });
@@ -171,13 +178,39 @@ async def _on_dialog(session: _Session, dialog: Any) -> None:
     action = session.dialog_action
     try:
         if action == "accept":
-            await dialog.accept(session.dialog_prompt_text or None)
+            if rec["type"] == "prompt":
+                await dialog.accept(session.dialog_prompt_text)
+            else:
+                await dialog.accept()
         else:
             await dialog.dismiss()
         rec["action"] = action
     except Exception as exc:
-        rec["action"] = f"error: {exc}"
-        _log.warning("dialog handling failed on session %s: %s", session.session_id, exc)
+        if action == "accept":
+            try:
+                await dialog.dismiss()
+                rec["action"] = "dismiss_fallback"
+                _log.warning(
+                    "dialog accept failed on session %s; dismissed instead: %s",
+                    session.session_id,
+                    exc,
+                )
+            except Exception as fallback_exc:
+                rec["action"] = (
+                    f"error: {exc}; dismiss fallback failed: {fallback_exc}"
+                )
+                _log.warning(
+                    "dialog handling failed on session %s: %s; "
+                    "dismiss fallback failed: %s",
+                    session.session_id,
+                    exc,
+                    fallback_exc,
+                )
+        else:
+            rec["action"] = f"error: {exc}"
+            _log.warning(
+                "dialog handling failed on session %s: %s", session.session_id, exc
+            )
     session.dialog_log.append(rec)
     if len(session.dialog_log) > _DIALOG_CAP:
         del session.dialog_log[: len(session.dialog_log) - _DIALOG_CAP]
@@ -281,13 +314,27 @@ async def _make_page(session: _Session) -> Any:
     return page, pid
 
 
-async def _close_session(session: _Session) -> None:
+async def _run_cleanup(label: str, awaitable: Any, errors: List[str]) -> None:
+    try:
+        await asyncio.wait_for(awaitable, timeout=_CLEANUP_TIMEOUT)
+    except asyncio.TimeoutError:
+        message = f"{label} timed out after {_CLEANUP_TIMEOUT:.1f}s"
+        errors.append(message)
+        _log.warning("session cleanup: %s", message)
+    except Exception as exc:
+        message = f"{label} failed: {exc}"
+        errors.append(message)
+        _log.warning("session cleanup: %s", message)
+
+
+async def _close_session(session: _Session) -> List[str]:
     if session.closed:
-        return
+        return []
     # Set closed=True BEFORE closing pages so that in-flight tools force-closed
     # mid-Playwright-call see s.closed=True in their except and return a clean
     # _err("session closed") instead of raw Playwright noise.
     session.closed = True
+    errors: List[str] = []
     got_lock = False
     try:
         await asyncio.wait_for(session.lock.acquire(), timeout=_CLOSE_DRAIN_TIMEOUT)
@@ -299,25 +346,27 @@ async def _close_session(session: _Session) -> None:
             session.session_id, _CLOSE_DRAIN_TIMEOUT,
         )
     try:
-        for page in list(session.pages.values()):
+        for pid, page in list(session.pages.items()):
             try:
-                if not page.is_closed():
-                    await page.close()
-            except Exception:
-                pass
+                closed = page.is_closed()
+            except Exception as exc:
+                message = f"page {pid} state check failed: {exc}"
+                _log.warning("session cleanup: %s", message)
+                closed = False
+            if not closed:
+                await _run_cleanup(f"page {pid} close", page.close(), errors)
         if session.primary_context is not None:
-            try:
-                await session.primary_context.close()
-            except Exception:
-                pass
+            await _run_cleanup(
+                "primary context close", session.primary_context.close(), errors
+            )
         session.pages.clear()
-        try:
-            await session.ipw.__aexit__(None, None, None)
-        except Exception as exc:
-            _log.warning("error tearing down session %s: %s", session.session_id, exc)
+        await _run_cleanup(
+            "browser exit", session.ipw.__aexit__(None, None, None), errors
+        )
     finally:
         if got_lock:
             session.lock.release()
+    return errors
 
 
 async def _close_all_sessions() -> None:
@@ -325,7 +374,11 @@ async def _close_all_sessions() -> None:
         sessions = list(_SESSIONS.values())
         _SESSIONS.clear()
     for s in sessions:
-        await _close_session(s)
+        errors = await _close_session(s)
+        if errors:
+            _log.warning(
+                "session %s closed with %d cleanup error(s)", s.session_id, len(errors)
+            )
 
 
 @asynccontextmanager
@@ -379,11 +432,6 @@ async def fetch_binary(ctx: Context, force: bool = False) -> Dict[str, Any]:
     """
     import shutil
 
-    vdir = cache_dir_for_version(BINARY_VERSION)
-    if force and vdir.exists():
-        await ctx.info("force: removing existing cache dir")
-        await asyncio.to_thread(shutil.rmtree, str(vdir), True)
-
     loop = asyncio.get_running_loop()
 
     # progress/status run on the asyncio.to_thread worker thread and cannot
@@ -416,10 +464,22 @@ async def fetch_binary(ctx: Context, force: bool = False) -> Dict[str, Any]:
         _log.info("fetch_binary phase=%s", phase)
         _emit(ctx.report_progress(0.0, None, phase))
 
-    await ctx.info("ensuring patched Firefox binary (may download ~100 MB)")
-    path = await asyncio.to_thread(ensure_binary, BINARY_VERSION, _progress, _status)
-    await ctx.info(f"binary ready at {path}")
-    return _ok(path=str(path), version=BINARY_VERSION, cache_root=str(cache_root()))
+    async with _BINARY_LOCK:
+        try:
+            vdir = cache_dir_for_version(BINARY_VERSION)
+            if force and vdir.exists():
+                await ctx.info("force: removing existing cache dir")
+                await asyncio.to_thread(shutil.rmtree, str(vdir))
+            await ctx.info("ensuring patched Firefox binary (may download ~100 MB)")
+            path = await asyncio.to_thread(
+                ensure_binary, BINARY_VERSION, _progress, _status
+            )
+            await ctx.info(f"binary ready at {path}")
+        except Exception as exc:
+            return _err(f"fetch_binary failed: {exc}")
+        return _ok(
+            path=str(path), version=BINARY_VERSION, cache_root=str(cache_root())
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -502,16 +562,19 @@ async def start_session(
         if proxy_password:
             proxy["password"] = proxy_password
 
-    ipw = InvisiblePlaywright(
-        seed=seed,
-        headless=headless,
-        proxy=proxy,
-        humanize=humanize,
-        locale=locale or "auto",
-        timezone=timezone or "",
-        profile_dir=profile_dir or None,
-        prep_recaptcha=prep_recaptcha,
-    )
+    try:
+        ipw = InvisiblePlaywright(
+            seed=seed,
+            headless=headless,
+            proxy=proxy,
+            humanize=humanize,
+            locale=locale or "auto",
+            timezone=timezone or "",
+            profile_dir=profile_dir or None,
+            prep_recaptcha=prep_recaptcha,
+        )
+    except Exception as exc:
+        return _err(f"launch setup failed: {exc}")
 
     sid = secrets.token_hex(8)
     await ctx.info(f"launching session {sid} (seed={ipw.seed})")
@@ -536,8 +599,10 @@ async def start_session(
     try:
         page, pid = await _make_page(session)
     except Exception as exc:
-        await _close_session(session)
-        return _err(f"initial page failed: {exc}")
+        cleanup_errors = await _close_session(session)
+        return _err(
+            f"initial page failed: {exc}", cleanup_errors=cleanup_errors
+        )
     # Context now exists (primary_context on Browser path / the persistent context):
     # register the session-wide dialog handler so no tab can freeze on alert().
     _register_context_handlers(session)
@@ -562,8 +627,14 @@ async def close_session(session_id: str, ctx: Context) -> Dict[str, Any]:
         session = _SESSIONS.pop(session_id, None)
     if session is None:
         return _err(f"unknown session_id: {session_id!r}")
-    await _close_session(session)
+    cleanup_errors = await _close_session(session)
     await ctx.info(f"closed session {session_id}")
+    if cleanup_errors:
+        return _err(
+            "session closed but cleanup failed",
+            session_id=session_id,
+            cleanup_errors=cleanup_errors,
+        )
     return _ok(session_id=session_id)
 
 
@@ -657,14 +728,20 @@ async def close_page(session_id: str, ctx: Context, page_id: Optional[int] = Non
         target = page_id if page_id is not None else s.active_page_id
         if target is None:
             return _err("no page to close")
-        page = s.pages.pop(target, None)
+        page = s.pages.get(target)
         if page is None:
             return _err(f"unknown page_id: {target}")
         try:
             if not page.is_closed():
                 await page.close()
         except Exception as exc:
-            return _pw_err(s, "close_page", exc)
+            try:
+                closed = page.is_closed()
+            except Exception:
+                closed = False
+            if not closed:
+                return _pw_err(s, "close_page", exc)
+        s.pages.pop(target, None)
         if s.active_page_id == target:
             s.active_page_id = next(iter(s.pages), None)
         return _ok(closed_page_id=target, active_page_id=s.active_page_id)
@@ -738,13 +815,25 @@ async def goto(
             except Exception as exc:
                 return _pw_err(s, "goto", exc)
             status = resp.status if resp is not None else None
-            return _ok(url=page.url, status=status, title=await page.title())
+            try:
+                title = await page.title()
+            except Exception as exc:
+                if s.closed:
+                    return _pw_err(s, "goto", exc)
+                return _ok(
+                    url=page.url,
+                    status=status,
+                    title=None,
+                    title_error=str(exc),
+                )
+            return _ok(url=page.url, status=status, title=title)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
 
 @mcp.tool()
 async def go_forward(session_id: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
+    """Navigate the active page forward by one browser-history entry."""
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -758,6 +847,7 @@ async def go_forward(session_id: str, ctx: Context, timeout_ms: int = 30000) -> 
 
 @mcp.tool()
 async def reload(session_id: str, ctx: Context, timeout_ms: int = 30000, wait_until: str = "load") -> Dict[str, Any]:
+    """Reload the active page and wait for the requested lifecycle state."""
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -912,6 +1002,7 @@ async def hover(
 
 @mcp.tool()
 async def focus(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
+    """Focus the first element matching ``selector``."""
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -988,6 +1079,8 @@ async def get_text(
     max_chars: int = 20000,
 ) -> Dict[str, Any]:
     """Get visible text. Empty ``selector`` = the whole body. Output is capped to ``max_chars``."""
+    if max_chars < 0:
+        return _err("max_chars must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1014,6 +1107,8 @@ async def get_html(
     max_chars: int = 20000,
 ) -> Dict[str, Any]:
     """Get HTML. Empty ``selector`` = full document (``page.content()``). Capped to ``max_chars``."""
+    if max_chars < 0:
+        return _err("max_chars must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1063,6 +1158,8 @@ async def query_elements(
     placeholder, visible flag and bounding rect. Useful for the LLM to decide
     what to click next without scraping raw HTML.
     """
+    if max_results < 0:
+        return _err("max_results must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1082,14 +1179,18 @@ async def is_visible(
     timeout_ms: int = 5000,
 ) -> Dict[str, Any]:
     """Check whether ``selector`` matches a visible element (with a short wait)."""
+    if timeout_ms < 0:
+        return _err("timeout_ms must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:
                 loc = page.locator(selector)
-                visible = await loc.first.is_visible(timeout=timeout_ms)
+                await loc.first.wait_for(state="visible", timeout=timeout_ms)
+            except PlaywrightTimeoutError:
+                return _ok(selector=selector, visible=False)
             except Exception as exc:
                 return _pw_err(s, "is_visible", exc)
-            return _ok(selector=selector, visible=bool(visible))
+            return _ok(selector=selector, visible=True)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1113,9 +1214,15 @@ async def screenshot(
     ``image_format="png"`` for lossless (much larger) output. ``full_page=True``
     captures the whole scrollable page.
     """
+    fmt = (image_format or "jpeg").lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in ("jpeg", "png"):
+        raise RuntimeError("image_format must be 'jpeg', 'jpg', or 'png'")
+    if fmt == "jpeg" and not 0 <= quality <= 100:
+        raise RuntimeError("quality must be between 0 and 100 for JPEG")
     try:
         async with _use_page(session_id) as (s, page):
-            fmt = (image_format or "jpeg").lower()
             try:
                 if fmt == "png":
                     data = await page.screenshot(full_page=full_page, type="png")
@@ -1241,14 +1348,30 @@ async def mouse_drag(
     """
     try:
         async with _use_page(session_id) as (s, page):
+            pressed = False
             try:
                 await page.mouse.move(from_x, from_y)
                 await page.mouse.down()
+                pressed = True
                 await page.mouse.move(to_x, to_y, steps=max(1, steps))
                 await page.mouse.up()
+                pressed = False
             except Exception as exc:
+                if pressed:
+                    try:
+                        await page.mouse.up()
+                    except Exception as release_exc:
+                        _log.warning(
+                            "mouse_drag release failed on session %s: %s",
+                            s.session_id,
+                            release_exc,
+                        )
                 return _pw_err(s, "mouse_drag", exc)
-            return _ok(from_xy=[from_x, from_y], to_xy=[to_x, to_y], steps=steps)
+            return _ok(
+                from_xy=[from_x, from_y],
+                to_xy=[to_x, to_y],
+                steps=max(1, steps),
+            )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1567,16 +1690,47 @@ async def list_frames(session_id: str, ctx: Context) -> Dict[str, Any]:
     selectors with ``>>>`` (e.g. ``"iframe#outer >>> iframe.inner"``)."""
     js = r"""
     () => {
-      // Escape a value for use inside a double-quoted CSS attribute selector:
-      // backslash -> \\ and " -> \" . Without this, a name/src containing a
-      // double quote yields an invalid selector and every frame_* tool fails.
+      // 转义双引号 CSS 属性选择器中的反斜杠和双引号。
       const escAttr = (s) => String(s).split('\\').join('\\\\').split('"').join('\\"');
+      const isUnique = (selector) => {
+        try {
+          return document.querySelectorAll(selector).length === 1;
+        } catch (_) {
+          return false;
+        }
+      };
+
+      // 从目标元素逐层构造结构路径；nth-of-type 只使用当前父元素内的同类兄弟序号。
+      const buildPath = (element) => {
+        const parts = [];
+        let current = element;
+        while (current) {
+          if (current === document.documentElement) {
+            parts.unshift(current.localName);
+            break;
+          }
+          const parent = current.parentElement;
+          if (!parent) break;
+          const sameType = Array.from(parent.children)
+            .filter((sibling) => sibling.localName === current.localName);
+          parts.unshift(
+            current.localName + ':nth-of-type(' + (sameType.indexOf(current) + 1) + ')'
+          );
+          current = parent;
+        }
+        return parts.join(' > ');
+      };
+
       return Array.from(document.querySelectorAll('iframe')).map((e, i) => {
-        let sel;
-        if (e.id) sel = 'iframe#' + CSS.escape(e.id);
-        else if (e.getAttribute('name')) sel = 'iframe[name="' + escAttr(e.getAttribute('name')) + '"]';
-        else if (e.getAttribute('src')) sel = 'iframe[src="' + escAttr(e.getAttribute('src')) + '"]';
-        else sel = 'iframe:nth-of-type(' + (i + 1) + ')';
+        const candidates = [];
+        if (e.id) candidates.push('iframe#' + CSS.escape(e.id));
+        if (e.getAttribute('name')) {
+          candidates.push('iframe[name="' + escAttr(e.getAttribute('name')) + '"]');
+        }
+        if (e.getAttribute('src')) {
+          candidates.push('iframe[src="' + escAttr(e.getAttribute('src')) + '"]');
+        }
+        const sel = candidates.find(isUnique) || buildPath(e);
         return { index: i, id: e.id || null, name: e.getAttribute('name'),
                  src: e.getAttribute('src'), suggested_selector: sel };
       });
@@ -1672,6 +1826,8 @@ async def frame_get_text(
     """Get inner text of ``selector`` inside the iframe ``frame_selector``.
 
     Defaults to the frame's whole ``body``. Output is capped to ``max_chars``."""
+    if max_chars < 0:
+        return _err("max_chars must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1722,6 +1878,8 @@ async def frame_query_elements(
     Same shape as ``query_elements`` but frame-aware (the page-level version can't
     see into iframes). ``frame_selector`` is the iframe CSS selector chain
     (``>>>`` for nesting); the frames must already be present on the page."""
+    if max_results < 0:
+        return _err("max_results must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1787,6 +1945,8 @@ async def frame_get_html(
     Empty ``selector`` = the frame's full content (``frame.content()``);
     otherwise the matched element's ``outerHTML``. Capped to ``max_chars``.
     """
+    if max_chars < 0:
+        return _err("max_chars must be >= 0")
     try:
         async with _use_page(session_id) as (s, page):
             try:

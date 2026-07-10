@@ -9,13 +9,17 @@ description = "MCP server that exposes the invisible_playwright anti-detect brow
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "opencode" }]
+authors = [{ name = "LowOrbitLab" }]
 keywords = ["mcp", "playwright", "anti-detect", "browser-automation", "scraping"]
 dependencies = [
-    "mcp>=1.2",
-    "invisible-playwright>=0.3.0",
-    "anyio>=4",
+    "mcp>=1.2,<2",
+    "invisible-playwright>=0.3.0,<0.4",
+    "playwright>=1.40,<1.61",
 ]
+
+[project.urls]
+Repository = "https://github.com/LowOrbitLab/invisible-playwright-mcp"
+Issues = "https://github.com/LowOrbitLab/invisible-playwright-mcp/issues"
 
 [project.scripts]
 invisible-playwright-mcp = "invisible_playwright_mcp.server:main"
