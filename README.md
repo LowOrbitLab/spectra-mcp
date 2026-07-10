@@ -126,7 +126,7 @@ the same `seed`).
 | `start_session` | Launch a browser with a fresh/seeded fingerprint. Returns `session_id`, `seed`, `page_id`. |
 | `close_session` | Close a session and free its Firefox process. |
 | `list_sessions` | Active session ids. |
-| `session_info` | Pages, active page, current url/title for a session. |
+| `session_info` | Session metadata, pages, active page id, URL and title. |
 
 ### Pages
 | Tool | Description |
@@ -134,18 +134,16 @@ the same `seed`).
 | `new_page` | Open a new tab; becomes the active page. |
 | `close_page` | Close a page (active by default). |
 | `switch_page` | Change the active page. |
-| `list_pages` | Pages in a session. |
 
 ### Navigation
-`goto`, `go_back`, `go_forward`, `reload`
+`goto`, `go_forward`, `reload`
 
 ### Interaction (humanized)
 `click`, `fill`, `type_text`, `press_key`, `keyboard_press`, `select_option`,
 `hover`, `focus`, `check`, `uncheck`, `scroll`
 
 ### Reading
-`get_url`, `get_title`, `get_text`, `get_html`, `get_attribute`,
-`query_elements`, `is_visible`
+`get_text`, `get_html`, `get_attribute`, `query_elements`, `is_visible`
 
 `query_elements` returns a structured snapshot (tag, id, name, type, role, href,
 text, value, placeholder, visible, bounding rect) so the LLM can decide what to

@@ -16,9 +16,7 @@ import asyncio
 import logging
 import os
 import secrets
-import shutil
 import sys
-import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -70,10 +68,7 @@ class _Session:
     dialog_action: str = "accept"  # how JS dialogs are auto-handled: accept|dismiss
     dialog_prompt_text: str = ""  # text submitted for prompt() when accepting
     dialog_log: List[dict] = field(default_factory=list)  # capped, newest-last
-    downloads: List[dict] = field(default_factory=list)  # history for list_downloads
-    downloads_dir: Optional[str] = None  # per-session tempdir (made in start_session)
     storage_state_path: Optional[str] = None  # seed cookies/localStorage at ctx creation
-    _dl_seq: int = 0  # monotonic download counter (collision-free filenames)
     _ctx_handlers_done: bool = False  # idempotency guard for context.on("dialog")
 
 
@@ -191,7 +186,7 @@ async def _on_dialog(session: _Session, dialog: Any) -> None:
 def _on_popup(session: _Session, popup: Any) -> None:
     """Adopt a popup / new tab (OAuth, window.open, target=_blank) into the session.
 
-    Sync (runs inline during the emit): assign an id and track it so list_pages /
+    Sync (runs inline during the emit): assign an id and track it so session_info /
     switch_page see it. Does NOT steal focus — active_page_id is unchanged. Also
     registers handlers on the popup so it can spawn its own popups."""
     if session.closed:
@@ -217,14 +212,6 @@ def _register_context_handlers(session: _Session) -> None:
         return
     c.on("dialog", partial(_on_dialog, session))
     session._ctx_handlers_done = True
-
-
-def _unique_download_path(session: _Session, suggested: str) -> str:
-    """A collision-free path under the session download dir (``N-suggested``)."""
-    session._dl_seq += 1
-    name = os.path.basename(suggested or "download") or "download"
-    base = session.downloads_dir or tempfile.gettempdir()
-    return os.path.join(base, f"{session._dl_seq}-{name}")
 
 
 def _frame_locator(page: Any, frame_selector: str) -> Any:
@@ -328,11 +315,6 @@ async def _close_session(session: _Session) -> None:
             await session.ipw.__aexit__(None, None, None)
         except Exception as exc:
             _log.warning("error tearing down session %s: %s", session.session_id, exc)
-        # Best-effort removal of the per-session download tempdir. Safe now that
-        # downloads save synchronously inside their tool (no fire-and-forget
-        # save_as can still hold a file handle open here).
-        if session.downloads_dir:
-            shutil.rmtree(session.downloads_dir, ignore_errors=True)
     finally:
         if got_lock:
             session.lock.release()
@@ -551,8 +533,6 @@ async def start_session(
         persistent=persistent,
     )
     session.storage_state_path = storage_state_path or None
-    # Per-session download dir; captured files land here and are removed on close.
-    session.downloads_dir = tempfile.mkdtemp(prefix=f"ipwmcp-{sid}-")
     try:
         page, pid = await _make_page(session)
     except Exception as exc:
@@ -607,7 +587,7 @@ async def list_sessions(ctx: Context) -> Dict[str, Any]:
 
 @mcp.tool()
 async def session_info(session_id: str, ctx: Context) -> Dict[str, Any]:
-    """Return details about a session: pages, active page, current url/title."""
+    """Return session metadata, pages, and the active page's URL/title."""
     try:
         s = await _get_session(session_id)
     except KeyError as exc:
@@ -621,11 +601,23 @@ async def session_info(session_id: str, ctx: Context) -> Dict[str, Any]:
                 pages_info.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
             except Exception:
                 pages_info.append({"page_id": pid, "url": None, "closed": True})
+        active_url = None
+        active_title = None
+        active_page = s.pages.get(s.active_page_id) if s.active_page_id is not None else None
+        if active_page is not None:
+            try:
+                if not active_page.is_closed():
+                    active_url = active_page.url
+                    active_title = await active_page.title()
+            except Exception:
+                pass
         return _ok(
             session_id=s.session_id,
             seed=s.seed,
             persistent=s.persistent,
             active_page_id=s.active_page_id,
+            active_url=active_url,
+            active_title=active_title,
             pages=pages_info,
         )
 
@@ -696,25 +688,6 @@ async def switch_page(session_id: str, page_id: int, ctx: Context) -> Dict[str, 
         return _ok(active_page_id=page_id, url=s.pages[page_id].url)
 
 
-@mcp.tool()
-async def list_pages(session_id: str, ctx: Context) -> Dict[str, Any]:
-    """List pages in a session with their id, url and closed flag."""
-    try:
-        s = await _get_session(session_id)
-    except KeyError as exc:
-        return _err(str(exc))
-    async with s.lock:
-        if s.closed:
-            return _err("session closed")
-        pages = []
-        for pid, page in s.pages.items():
-            try:
-                pages.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
-            except Exception:
-                pages.append({"page_id": pid, "url": None, "closed": True})
-        return _ok(active_page_id=s.active_page_id, pages=pages)
-
-
 # --------------------------------------------------------------------------- #
 # Navigation
 # --------------------------------------------------------------------------- #
@@ -766,19 +739,6 @@ async def goto(
                 return _pw_err(s, "goto", exc)
             status = resp.status if resp is not None else None
             return _ok(url=page.url, status=status, title=await page.title())
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
-
-
-@mcp.tool()
-async def go_back(session_id: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
-    try:
-        async with _use_page(session_id) as (s, page):
-            try:
-                ok = await page.go_back(timeout=timeout_ms)
-            except Exception as exc:
-                return _pw_err(s, "go_back", exc)
-            return _ok(url=page.url, navigated=bool(ok))
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1021,28 +981,6 @@ async def scroll(
 
 
 @mcp.tool()
-async def get_url(session_id: str, ctx: Context) -> Dict[str, Any]:
-    try:
-        async with _use_page(session_id) as (s, page):
-            return _ok(url=page.url)
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
-
-
-@mcp.tool()
-async def get_title(session_id: str, ctx: Context) -> Dict[str, Any]:
-    try:
-        async with _use_page(session_id) as (s, page):
-            try:
-                title = await page.title()
-            except Exception as exc:
-                return _pw_err(s, "get_title", exc)
-            return _ok(title=title)
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
-
-
-@mcp.tool()
 async def get_text(
     session_id: str,
     ctx: Context,
@@ -1279,120 +1217,8 @@ async def evaluate(
 
 
 # --------------------------------------------------------------------------- #
-# Files: upload & download
-# --------------------------------------------------------------------------- #
-
-
-@mcp.tool()
-async def set_input_files(
-    session_id: str,
-    selector: str,
-    files: List[str],
-    ctx: Context,
-    timeout_ms: int = 30000,
-) -> Dict[str, Any]:
-    """Set the file(s) for a file ``<input>`` matched by ``selector`` (upload).
-
-    ``files`` is a list of paths **on the machine running this server** (not the
-    LLM's host); pass an empty list to clear the selection. Files fetched with
-    ``download`` live under the session download dir and can be re-uploaded here.
-
-    Note: the patched anti-detect build (as of firefox-15) does not fire the
-    Juggler file-input events this relies on, so it may time out there; the call
-    is standard Playwright and works on a capable/newer binary.
-    """
-    try:
-        async with _use_page(session_id) as (s, page):
-            try:
-                await page.set_input_files(selector, list(files), timeout=timeout_ms)
-            except Exception as exc:
-                return _pw_err(s, "set_input_files", exc)
-            return _ok(selector=selector, count=len(files))
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
-
-
-@mcp.tool()
-async def download(
-    session_id: str,
-    trigger_selector: str,
-    ctx: Context,
-    save_path: str = "",
-    timeout_ms: int = 30000,
-) -> Dict[str, Any]:
-    """Download a file by clicking ``trigger_selector`` and capturing the result.
-
-    Wraps the click in Playwright's ``expect_download`` so the file the click
-    initiates is caught and saved — use this instead of ``click`` when a click
-    produces a download. Saves to ``save_path`` if given, else an auto-named file
-    under the session download dir. Returns the saved ``path``, ``suggested_filename``
-    and source ``url``.
-
-    Note: the patched anti-detect build (as of firefox-15) does not emit download
-    events, so this may time out there; the call is standard Playwright and works
-    on a capable/newer binary.
-    """
-    try:
-        async with _use_page(session_id) as (s, page):
-            try:
-                async with page.expect_download(timeout=timeout_ms) as dl_info:
-                    await page.click(trigger_selector, timeout=timeout_ms)
-                dl = await dl_info.value
-                dest = save_path or _unique_download_path(s, dl.suggested_filename)
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                await dl.save_as(dest)
-            except Exception as exc:
-                return _pw_err(s, "download", exc)
-            rec = {"path": dest, "suggested_filename": dl.suggested_filename, "url": dl.url}
-            s.downloads.append(rec)
-            return _ok(**rec)
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
-
-
-@mcp.tool()
-async def list_downloads(session_id: str, ctx: Context) -> Dict[str, Any]:
-    """List files downloaded in this session (path, suggested_filename, url)."""
-    try:
-        s = await _get_session(session_id)
-    except KeyError as exc:
-        return _err(str(exc))
-    async with s.lock:
-        if s.closed:
-            return _err("session closed")
-        return _ok(downloads=list(s.downloads), count=len(s.downloads))
-
-
-# --------------------------------------------------------------------------- #
 # Drag & coordinate mouse
 # --------------------------------------------------------------------------- #
-
-
-@mcp.tool()
-async def drag_and_drop(
-    session_id: str,
-    source_selector: str,
-    target_selector: str,
-    ctx: Context,
-    timeout_ms: int = 30000,
-) -> Dict[str, Any]:
-    """Drag the ``source_selector`` element and drop it onto ``target_selector``.
-
-    Note: the patched anti-detect build (as of firefox-15) does not support the
-    drag Juggler path, so this may time out there; the call is standard Playwright
-    and works on a capable/newer binary. For coordinate drags (sliders/canvas) see
-    ``mouse_drag``."""
-    try:
-        async with _use_page(session_id) as (s, page):
-            try:
-                await page.drag_and_drop(source_selector, target_selector, timeout=timeout_ms)
-            except Exception as exc:
-                return _pw_err(s, "drag_and_drop", exc)
-            return _ok(source=source_selector, target=target_selector)
-    except (KeyError, RuntimeError) as exc:
-        return _err(str(exc))
 
 
 @mcp.tool()
@@ -1599,7 +1425,7 @@ async def wait_for_page(
     New tabs (``window.open`` / ``target=_blank`` / OAuth popups) are adopted
     automatically; this waits until one appears and returns the new ``page_id``(s).
     Then ``switch_page`` to it. Because a popup may be adopted *before* this call,
-    pass the page ids you already had (``known_page_ids``, e.g. from ``list_pages``
+    pass the page ids you already had (``known_page_ids``, e.g. from ``session_info``
     before the click) so an already-open popup is returned immediately; otherwise
     the current pages form the baseline and only strictly-new tabs are reported."""
     try:
