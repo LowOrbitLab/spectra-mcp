@@ -403,10 +403,8 @@ async def binary_status(ctx: Context) -> Dict[str, Any]:
 
     Returns the cache path, version, and a ``ready`` flag. Does NOT download.
     """
-    import sys as _sys
-
     vdir = cache_dir_for_version(BINARY_VERSION)
-    entry_rel = BINARY_ENTRY_REL.get(_sys.platform)
+    entry_rel = BINARY_ENTRY_REL.get(sys.platform)
     entry = vdir / entry_rel if entry_rel else None
     ready = bool(entry and entry.exists())
     await ctx.debug(f"binary_status ready={ready} path={entry}")
@@ -667,7 +665,7 @@ async def session_info(session_id: str, ctx: Context) -> Dict[str, Any]:
         if s.closed:
             return _err("session closed")
         pages_info = []
-        for pid, page in s.pages.items():
+        for pid, page in list(s.pages.items()):
             try:
                 pages_info.append({"page_id": pid, "url": page.url, "closed": page.is_closed()})
             except Exception:
@@ -743,7 +741,14 @@ async def close_page(session_id: str, ctx: Context, page_id: Optional[int] = Non
                 return _pw_err(s, "close_page", exc)
         s.pages.pop(target, None)
         if s.active_page_id == target:
-            s.active_page_id = next(iter(s.pages), None)
+            s.active_page_id = None
+            for pid, candidate in list(s.pages.items()):
+                try:
+                    if not candidate.is_closed():
+                        s.active_page_id = pid
+                        break
+                except Exception:
+                    continue
         return _ok(closed_page_id=target, active_page_id=s.active_page_id)
 
 

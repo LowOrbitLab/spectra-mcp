@@ -53,6 +53,24 @@ class _AsyncToolTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeRecoveryTests(_AsyncToolTest):
+    async def test_session_info_snapshots_pages_before_reading_entries(self):
+        class Page(_Page):
+            session = None
+
+            @property
+            def url(self):
+                self.session.pages[2] = _Page()
+                return "https://example.test/"
+
+        page = Page()
+        session = await self.install_page("snapshot", page)
+        page.session = session
+
+        result = await server.session_info("snapshot", _Ctx())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([item["page_id"] for item in result["pages"]], [1])
+
     async def test_close_page_preserves_registration_when_close_fails(self):
         class Page(_Page):
             async def close(self):
@@ -64,6 +82,28 @@ class RuntimeRecoveryTests(_AsyncToolTest):
         self.assertFalse(result["ok"])
         self.assertIn(1, session.pages)
         self.assertIs(session.pages[1], session.pages.get(session.active_page_id))
+
+    async def test_close_page_skips_closed_pages_when_selecting_active_page(self):
+        class CloseablePage(_Page):
+            async def close(self):
+                self.closed = True
+
+        closed_page = _Page()
+        closed_page.closed = True
+        active_page = CloseablePage()
+        live_page = _Page()
+        session = await self.install_page("reselect", active_page)
+        session.pages.clear()
+        session.pages[1] = closed_page
+        session.pages[2] = active_page
+        session.pages[3] = live_page
+        session.active_page_id = 2
+
+        result = await server.close_page("reselect", _Ctx())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["active_page_id"], 3)
+        self.assertEqual(session.active_page_id, 3)
 
     async def test_goto_keeps_success_when_title_lookup_fails(self):
         class Page(_Page):
