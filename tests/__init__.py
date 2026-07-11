@@ -1,1 +1,1 @@
-"""invisible-playwright-mcp 测试包。"""
+"""Spectra MCP 测试包。"""

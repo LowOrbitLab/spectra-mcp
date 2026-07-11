@@ -1,4 +1,4 @@
-# invisible-playwright-mcp
+# Spectra MCP
 
 An [MCP](https://modelcontextprotocol.io) server that exposes
 [`invisible_playwright`](https://github.com/feder-cr/invisible_playwright) — an
@@ -34,7 +34,7 @@ LLM ──MCP/stdio──► server ──► InvisiblePlaywright ──► patc
 ## Install
 
 ```bash
-pip install -e .                       # or: pip install invisible-playwright-mcp
+pip install -e .                       # or: pip install spectra-mcp
 python -m invisible_playwright fetch   # one-time ~100 MB, SHA256-verified
 ```
 
@@ -54,9 +54,9 @@ macOS arm64/x86_64.
 ```jsonc
 {
   "mcp": {
-    "invisible-playwright": {
+    "spectra-mcp": {
       "type": "local",
-      "command": ["invisible-playwright-mcp"],
+      "command": ["spectra-mcp"],
       "enabled": true
     }
   }
@@ -68,8 +68,8 @@ macOS arm64/x86_64.
 ```json
 {
   "mcpServers": {
-    "invisible-playwright": {
-      "command": "invisible-playwright-mcp"
+    "spectra-mcp": {
+      "command": "spectra-mcp"
     }
   }
 }
@@ -80,8 +80,8 @@ macOS arm64/x86_64.
 ```json
 {
   "mcpServers": {
-    "invisible-playwright": {
-      "command": "invisible-playwright-mcp"
+    "spectra-mcp": {
+      "command": "spectra-mcp"
     }
   }
 }
@@ -90,7 +90,7 @@ macOS arm64/x86_64.
 If the console script isn't on `PATH`, use the module form instead:
 
 ```json
-{ "command": "python", "args": ["-m", "invisible_playwright_mcp"] }
+{ "command": "python", "args": ["-m", "spectra_mcp"] }
 ```
 
 ---

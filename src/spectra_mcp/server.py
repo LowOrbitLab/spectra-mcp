@@ -38,7 +38,7 @@ from invisible_playwright.download import (
 )
 
 # Logging MUST go to stderr: stdio transport reserves stdout for JSON-RPC.
-_log = logging.getLogger("invisible_playwright_mcp")
+_log = logging.getLogger("spectra_mcp")
 if not _log.handlers:
     _h = logging.StreamHandler(sys.stderr)
     _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
@@ -389,7 +389,7 @@ async def _lifespan(app: FastMCP):
         await _close_all_sessions()
 
 
-mcp = FastMCP("invisible-playwright-mcp", lifespan=_lifespan)
+mcp = FastMCP("spectra-mcp", lifespan=_lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -1998,7 +1998,7 @@ async def frame_get_attribute(
 
 def main() -> None:
     """Run the MCP server over stdio."""
-    _log.info("starting invisible-playwright-mcp (stdio)")
+    _log.info("starting spectra-mcp (stdio)")
     mcp.run(transport="stdio")
 
 

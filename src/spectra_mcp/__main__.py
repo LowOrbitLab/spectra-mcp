@@ -1,4 +1,4 @@
-"""Enable `python -m invisible_playwright_mcp`."""
+"""支持通过 `python -m spectra_mcp` 启动服务。"""
 
 from .server import main
 

@@ -1,4 +1,4 @@
-"""invisible_playwright MCP server package."""
+"""Spectra MCP 服务包。"""
 
 from .server import main, mcp
 

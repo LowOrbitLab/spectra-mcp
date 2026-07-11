@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-import invisible_playwright_mcp.server as server
+import spectra_mcp.server as server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -336,10 +336,15 @@ class MetadataTests(unittest.TestCase):
         self.assertIn("`storage_state_path`", readme)
 
     def test_release_metadata_uses_loworbitlab_identity(self):
-        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
-            "project"
-        ]
+        document = tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        project = document["project"]
 
+        self.assertEqual(project["name"], "spectra-mcp")
+        self.assertEqual(
+            project["scripts"], {"spectra-mcp": "spectra_mcp.server:main"}
+        )
         self.assertEqual(project["authors"], [{"name": "LowOrbitLab"}])
         self.assertTrue((ROOT / "LICENSE").is_file())
         self.assertNotIn("anyio>=4", project["dependencies"])
