@@ -114,6 +114,37 @@ the same `seed`).
 
 ## Tool reference
 
+Tool exposure is selected at server startup with `SPECTRA_MCP_TOOL_PROFILE`:
+
+| Profile | Tools | Approx. tool tokens | Intended use |
+|---------|------:|--------------------:|--------------|
+| `setup` | 2 | ~230 | Binary status/download only. |
+| `core` | 28 | ~4,165 | Default. Setup plus normal browsing, reading, forms, tabs, screenshots and `evaluate`. |
+| `full` | 55 | ~7,942 | Every advanced mouse, keyboard, dialog, cookie/storage and frame tool. |
+
+Token estimates use the `o200k_base` tokenizer and an OpenAI-style function-tool
+payload. Exact numbers vary by MCP client and whether output schemas are included.
+
+`core` includes session lifecycle, page switching/popups, `goto`/`reload`,
+`click`/`fill`/`type_text`/`press_key`, scrolling/hover/selects, text/HTML/
+attribute/element reads, visibility, screenshots, waits and `evaluate`.
+
+```bash
+SPECTRA_MCP_TOOL_PROFILE=core spectra-mcp
+SPECTRA_MCP_TOOL_PROFILE=full spectra-mcp
+```
+
+PowerShell equivalent:
+
+```powershell
+$env:SPECTRA_MCP_TOOL_PROFILE = "full"
+spectra-mcp
+```
+
+The server must be restarted after changing profiles. The reference below lists
+the complete `full` profile; disabled functions remain available internally for
+tests but are not advertised to the model.
+
 ### Setup / binary
 | Tool | Description |
 |------|-------------|

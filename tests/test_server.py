@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -649,10 +651,42 @@ class ContractTests(_AsyncToolTest):
 class MetadataTests(unittest.TestCase):
     def test_every_registered_tool_has_a_description(self):
         tools = asyncio.run(server.mcp.list_tools())
-        self.assertEqual(len(tools), 55)
+        expected_counts = {"setup": 2, "core": 28, "full": 55}
+        self.assertEqual(len(tools), expected_counts[server._TOOL_PROFILE])
         self.assertEqual(
             [tool.name for tool in tools if not (tool.description or "").strip()], []
         )
+
+    def test_tool_profiles_register_expected_tools(self):
+        script = (
+            "import asyncio,json; import spectra_mcp.server as s; "
+            "print(json.dumps([t.name for t in asyncio.run(s.mcp.list_tools())]))"
+        )
+        expected_counts = {"setup": 2, "core": 28, "full": 55}
+        for profile, expected_count in expected_counts.items():
+            with self.subTest(profile=profile):
+                env = os.environ.copy()
+                env["SPECTRA_MCP_TOOL_PROFILE"] = profile
+                env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get(
+                    "PYTHONPATH", ""
+                )
+                output = subprocess.check_output(
+                    [sys.executable, "-c", script],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                )
+                names = json.loads(output)
+                self.assertEqual(len(names), expected_count)
+                if profile == "setup":
+                    self.assertEqual(names, ["binary_status", "fetch_binary"])
+                if profile == "core":
+                    self.assertIn("start_session", names)
+                    self.assertIn("scroll", names)
+                    self.assertNotIn("frame_click", names)
+                if profile == "full":
+                    self.assertIn("frame_click", names)
+                    self.assertIn("save_storage_state", names)
 
     def test_tool_schema_exposes_enum_constraints(self):
         tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}

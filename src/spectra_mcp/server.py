@@ -682,6 +682,77 @@ async def _lifespan(app: FastMCP):
 
 mcp = FastMCP("spectra-mcp", lifespan=_lifespan)
 
+_SETUP_TOOL_NAMES = {
+    "binary_status",
+    "fetch_binary",
+}
+
+_CORE_TOOL_NAMES = _SETUP_TOOL_NAMES | {
+    "start_session",
+    "close_session",
+    "list_sessions",
+    "session_info",
+    "new_page",
+    "close_page",
+    "switch_page",
+    "wait_for_page",
+    "goto",
+    "reload",
+    "click",
+    "fill",
+    "type_text",
+    "press_key",
+    "scroll",
+    "hover",
+    "select_option",
+    "get_text",
+    "get_html",
+    "get_attribute",
+    "query_elements",
+    "is_visible",
+    "screenshot",
+    "wait_for_selector",
+    "wait_for_timeout",
+    "evaluate",
+}
+
+
+def _normalize_tool_profile(value: str) -> str:
+    profile = (value or "core").strip().lower()
+    if profile not in {"setup", "core", "full"}:
+        _log.warning("unknown tool profile %r; using core", value)
+        return "core"
+    return profile
+
+
+_TOOL_PROFILE = _normalize_tool_profile(
+    os.environ.get("SPECTRA_MCP_TOOL_PROFILE", "core")
+)
+
+
+def _tool_enabled(name: str, profile: Optional[str] = None) -> bool:
+    selected = _normalize_tool_profile(profile) if profile is not None else _TOOL_PROFILE
+    if selected == "full":
+        return True
+    if selected == "setup":
+        return name in _SETUP_TOOL_NAMES
+    return name in _CORE_TOOL_NAMES
+
+
+_register_mcp_tool = mcp.tool
+
+
+def _profiled_tool(*args: Any, **kwargs: Any):
+    def _decorate(func: Any) -> Any:
+        if not _tool_enabled(func.__name__):
+            return func
+        return _register_mcp_tool(*args, **kwargs)(func)
+
+    return _decorate
+
+
+mcp.tool = _profiled_tool  # type: ignore[method-assign]
+
 
 # --------------------------------------------------------------------------- #
 # Setup / binary tools
@@ -702,6 +773,7 @@ async def binary_status(ctx: Context) -> Dict[str, Any]:
     return _ok(
         ready=ready,
         version=BINARY_VERSION,
+        tool_profile=_TOOL_PROFILE,
         cache_dir=str(vdir),
         entry=str(entry) if entry else None,
         cache_root=str(cache_root()),
@@ -2477,7 +2549,7 @@ async def frame_get_attribute(
 
 def main() -> None:
     """Run the MCP server over stdio."""
-    _log.info("starting spectra-mcp (stdio)")
+    _log.info("starting spectra-mcp (stdio, tool_profile=%s)", _TOOL_PROFILE)
     mcp.run(transport="stdio")
 
 
