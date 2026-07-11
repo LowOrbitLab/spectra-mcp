@@ -157,6 +157,10 @@ click without scraping raw HTML.
 ### Waiting
 `wait_for_selector`, `wait_for_timeout`
 
+`wait_for_selector` returns `reached=true` when the requested state is reached;
+`element_present` reports whether an element handle still exists (it is normally
+`false` after successful `hidden` / `detached` waits).
+
 ### Advanced
 `evaluate` — run arbitrary JavaScript in the page and return its value. Powerful;
 use sparingly.
@@ -185,7 +189,8 @@ the active page.
 `get_cookies`, `add_cookies`, `clear_cookies`, `save_storage_state`
 
 Storage state contains cookies and localStorage. Treat saved files as secrets and
-resume them with `start_session(storage_state_path=...)`.
+resume them with `start_session(storage_state_path=...)`. Files are written via a
+private temporary file and atomically replaced; on Unix the final mode is `0600`.
 
 ### Frames
 `list_frames`, `frame_click`, `frame_fill`, `frame_type`, `frame_get_text`,
@@ -211,6 +216,35 @@ with `>>>` to address nested iframes.
 | `profile_dir` | `""` | Persistent profile path (enables persistent context). |
 | `prep_recaptcha` | `false` | Pre-seed reCAPTCHA cookies (non-persistent only). |
 | `storage_state_path` | `""` | JSON file created by `save_storage_state`; cannot be combined with `profile_dir`. |
+
+---
+
+## Runtime safeguards
+
+The resident server applies hard limits so a single tool call cannot exhaust the
+browser host or the stdio/MCP channel. Defaults can be changed with environment
+variables:
+
+- `SPECTRA_MCP_MAX_SESSIONS=8`
+- `SPECTRA_MCP_MAX_PAGES_PER_SESSION=32`
+- `SPECTRA_MCP_MAX_TEXT_CHARS=200000`
+- `SPECTRA_MCP_MAX_ELEMENT_RESULTS=500`
+- `SPECTRA_MCP_MAX_TIMEOUT_MS=300000`
+- `SPECTRA_MCP_MAX_DELAY_MS=10000`
+- `SPECTRA_MCP_MAX_CLICK_COUNT=10`
+- `SPECTRA_MCP_MAX_MOUSE_STEPS=1000`
+- `SPECTRA_MCP_MAX_SCREENSHOT_BYTES=10485760`
+- `SPECTRA_MCP_MAX_SCREENSHOT_PIXELS=50000000`
+- `SPECTRA_MCP_MAX_EVALUATE_RESULT_BYTES=1048576`
+
+Set `SPECTRA_MCP_DATA_ROOT` to restrict `profile_dir`, storage-state input, and
+storage-state output to one filesystem tree. When it is unset, arbitrary local
+paths remain available for trusted local MCP use.
+
+`timeout_ms=0` keeps Playwright's conventional “no timeout” meaning. Negative
+timeouts and positive values above the configured maximum are rejected.
+`fetch_binary(force=true)` is rejected while sessions are active or cleaning up;
+binary launch/download/cache mutation is serialized with a cross-process lock.
 
 ---
 
@@ -240,6 +274,13 @@ The regression suite uses only Python's standard library:
 ```bash
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
+```
+
+Real-browser integration checks are opt-in because they launch the patched
+Firefox and may require network access for session geo initialization:
+
+```bash
+SPECTRA_MCP_RUN_INTEGRATION=1 python -m unittest tests.test_integration -v
 ```
 
 ---

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import tempfile
 import threading
 import time
 import tomllib
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -28,6 +32,11 @@ class _Ctx:
         return None
 
 
+@asynccontextmanager
+async def _noop_binary_guard():
+    yield
+
+
 class _Page:
     url = "https://example.test/"
 
@@ -42,6 +51,7 @@ class _AsyncToolTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         async with server._LOCK:
             server._SESSIONS.clear()
+            server._STARTING_SESSIONS = 0
 
     async def install_page(self, sid: str, page, ipw=None):
         session = server._Session(sid, ipw, object(), 1, False)
@@ -104,6 +114,30 @@ class RuntimeRecoveryTests(_AsyncToolTest):
         self.assertTrue(result["ok"])
         self.assertEqual(result["active_page_id"], 3)
         self.assertEqual(session.active_page_id, 3)
+
+    async def test_active_page_state_failure_returns_error_dict(self):
+        class BrokenPage(_Page):
+            def is_closed(self):
+                raise ValueError("connection lost")
+
+        await self.install_page("broken-active", BrokenPage())
+
+        result = await server.get_text("broken-active", _Ctx())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("state check failed", result["error"])
+
+    async def test_switch_page_state_failure_returns_error_dict(self):
+        class BrokenPage(_Page):
+            def is_closed(self):
+                raise ValueError("connection lost")
+
+        await self.install_page("broken-switch", BrokenPage())
+
+        result = await server.switch_page("broken-switch", 1, _Ctx())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("switch_page failed", result["error"])
 
     async def test_goto_keeps_success_when_title_lookup_fails(self):
         class Page(_Page):
@@ -202,6 +236,259 @@ class RuntimeRecoveryTests(_AsyncToolTest):
         await server._on_dialog(session, dialog)
 
         self.assertEqual(dialog.prompt_text, "")
+
+
+class LifecycleHardeningTests(_AsyncToolTest):
+    async def test_start_session_cancellation_cleans_unpublished_browser(self):
+        class Context:
+            pages = []
+
+            async def new_page(self):
+                raise asyncio.CancelledError()
+
+        class IPW:
+            seed = 7
+
+            def __init__(self, *args, **kwargs):
+                self.exit_called = False
+
+            async def __aenter__(self):
+                return Context()
+
+            async def __aexit__(self, *args):
+                self.exit_called = True
+
+        ipw = IPW()
+        with (
+            patch.object(server, "InvisiblePlaywright", return_value=ipw),
+            patch.object(server, "_binary_cache_guard", _noop_binary_guard),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await server.start_session(_Ctx())
+
+        self.assertTrue(ipw.exit_called)
+        self.assertEqual(server._SESSIONS, {})
+
+    async def test_close_session_retries_failed_browser_exit(self):
+        class Page(_Page):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            async def close(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("page close failed")
+                self.closed = True
+
+        class IPW:
+            def __init__(self):
+                self.calls = 0
+
+            async def __aexit__(self, *args):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("exit failed")
+
+        ipw = IPW()
+        session = server._Session("retry", ipw, object(), 1, False)
+        page = Page()
+        session.pages[1] = page
+        async with server._LOCK:
+            server._SESSIONS["retry"] = session
+
+        first = await server.close_session("retry", _Ctx())
+        second = await server.close_session("retry", _Ctx())
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(first["cleanup_complete"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(page.calls, 2)
+        self.assertEqual(ipw.calls, 2)
+        self.assertNotIn("retry", server._SESSIONS)
+
+    async def test_persistent_context_adopts_existing_page(self):
+        initial_page = _Page()
+
+        class Context:
+            def __init__(self):
+                self.pages = [initial_page]
+                self.new_page_calls = 0
+
+            async def new_page(self):
+                self.new_page_calls += 1
+                return _Page()
+
+        initial_page.on = lambda *args: None
+        context = Context()
+        session = server._Session("persistent", object(), context, 1, True)
+
+        page, pid = await server._initialize_session_page(session)
+
+        self.assertIs(page, initial_page)
+        self.assertEqual(pid, 1)
+        self.assertEqual(context.new_page_calls, 0)
+        self.assertIs(session.pages[1], initial_page)
+
+    async def test_session_limit_rejects_before_browser_construction(self):
+        await self.install_page("existing", _Page())
+        with (
+            patch.object(server, "_MAX_SESSIONS", 1),
+            patch.object(server, "InvisiblePlaywright") as constructor,
+        ):
+            result = await server.start_session(_Ctx())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("session limit", result["error"])
+        constructor.assert_not_called()
+
+    async def test_new_page_limit_closes_untracked_page(self):
+        created = _Page()
+
+        async def close():
+            created.closed = True
+
+        created.close = close
+        context = SimpleNamespace(new_page=AsyncMock(return_value=created))
+        session = await self.install_page("page-limit", _Page())
+        session.browser_or_ctx = SimpleNamespace(new_context=AsyncMock())
+        session.primary_context = context
+        with patch.object(server, "_MAX_PAGES_PER_SESSION", 1):
+            result = await server.new_page("page-limit", _Ctx())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("page limit", result["error"])
+        self.assertTrue(created.closed)
+
+
+class BoundaryTests(_AsyncToolTest):
+    async def test_evaluate_zero_timeout_disables_server_timeout(self):
+        page = _Page()
+        page.evaluate = AsyncMock(return_value={"value": 1})
+        await self.install_page("evaluate-zero", page)
+
+        result = await server.evaluate(
+            "evaluate-zero", "() => ({value: 1})", _Ctx(), timeout_ms=0
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], {"value": 1})
+
+    async def test_output_limit_rejects_excessive_value_before_page_call(self):
+        page = _Page()
+        page.inner_text = AsyncMock(return_value="text")
+        await self.install_page("output-limit", page)
+
+        result = await server.get_text(
+            "output-limit", _Ctx(), max_chars=server._MAX_TEXT_CHARS + 1
+        )
+
+        self.assertFalse(result["ok"])
+        page.inner_text.assert_not_awaited()
+
+    async def test_hidden_wait_reports_reached_without_match_confusion(self):
+        page = _Page()
+        page.wait_for_selector = AsyncMock(return_value=None)
+        await self.install_page("hidden", page)
+
+        result = await server.wait_for_selector(
+            "hidden", "#gone", _Ctx(), state="hidden"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["reached"])
+        self.assertFalse(result["element_present"])
+        self.assertNotIn("matched", result)
+
+    async def test_scroll_missing_selector_returns_error(self):
+        page = _Page()
+        page.query_selector = AsyncMock(return_value=None)
+        page.mouse = SimpleNamespace(wheel=AsyncMock())
+        await self.install_page("scroll", page)
+
+        result = await server.scroll("scroll", _Ctx(), dy=100, selector="#missing")
+
+        self.assertFalse(result["ok"])
+        page.mouse.wheel.assert_not_awaited()
+
+    async def test_storage_state_is_written_atomically_with_private_mode(self):
+        context = SimpleNamespace(
+            storage_state=AsyncMock(return_value={"cookies": [], "origins": []})
+        )
+        session = await self.install_page("storage", _Page())
+        session.primary_context = context
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "nested" / "state.json"
+
+            result = await server.save_storage_state(
+                "storage", str(target), _Ctx()
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                json.loads(target.read_text(encoding="utf-8")),
+                {"cookies": [], "origins": []},
+            )
+            self.assertEqual(list(target.parent.glob("*.tmp")), [])
+            if os.name != "nt":
+                self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    async def test_configured_data_root_rejects_path_escape(self):
+        session = await self.install_page("root", _Page())
+        session.primary_context = SimpleNamespace(storage_state=AsyncMock())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outside = Path(tmpdir).parent / "outside-state.json"
+            with patch.object(server, "_DATA_ROOT", tmpdir):
+                result = await server.save_storage_state(
+                    "root", str(outside), _Ctx()
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("configured data root", result["error"])
+
+    async def test_force_fetch_rejects_active_sessions(self):
+        await self.install_page("active", _Page())
+        with (
+            patch.object(server, "_binary_cache_guard", _noop_binary_guard),
+            patch.object(server, "ensure_binary") as ensure,
+        ):
+            result = await server.fetch_binary(_Ctx(), force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("sessions are active", result["error"])
+        ensure.assert_not_called()
+
+    async def test_binary_file_lock_is_released_when_waiter_is_cancelled(self):
+        started = threading.Event()
+        allow_acquire = threading.Event()
+        released = threading.Event()
+        handle = object()
+
+        def acquire(path):
+            started.set()
+            allow_acquire.wait(timeout=2)
+            return handle
+
+        def release(value):
+            self.assertIs(value, handle)
+            released.set()
+
+        async def use_guard():
+            async with server._binary_cache_guard():
+                self.fail("cancelled waiter must not enter the guarded section")
+
+        with (
+            patch.object(server, "_acquire_process_file_lock", acquire),
+            patch.object(server, "_release_process_file_lock", release),
+        ):
+            task = asyncio.create_task(use_guard())
+            await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            allow_acquire.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(released.is_set())
 
 
 class ContractTests(_AsyncToolTest):
@@ -365,6 +652,18 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(len(tools), 55)
         self.assertEqual(
             [tool.name for tool in tools if not (tool.description or "").strip()], []
+        )
+
+    def test_tool_schema_exposes_enum_constraints(self):
+        tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+
+        self.assertEqual(
+            tools["click"].inputSchema["properties"]["button"]["enum"],
+            ["left", "middle", "right"],
+        )
+        self.assertEqual(
+            tools["wait_for_selector"].inputSchema["properties"]["state"]["enum"],
+            ["attached", "detached", "hidden", "visible"],
         )
 
     def test_readme_mentions_every_tool_and_storage_state_parameter(self):

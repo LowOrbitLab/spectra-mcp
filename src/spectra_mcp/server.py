@@ -13,14 +13,17 @@ session.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
 import sys
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import Context, FastMCP, Image
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -64,7 +67,11 @@ class _Session:
     pages: Dict[int, Any] = field(default_factory=dict)  # page_id -> Page
     next_page_id: int = 1
     active_page_id: Optional[int] = None
+    ready: bool = True
     closed: bool = False
+    cleanup_complete: bool = False
+    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    cleanup_task: Optional[asyncio.Task] = field(default=None, repr=False)
     # --- capability state (all defaulted; mutable ones need default_factory or
     # the dataclass raises at import) ---
     dialog_action: str = "accept"  # how JS dialogs are auto-handled: accept|dismiss
@@ -77,6 +84,7 @@ class _Session:
 _SESSIONS: Dict[str, _Session] = {}
 _LOCK = asyncio.Lock()
 _BINARY_LOCK = asyncio.Lock()
+_STARTING_SESSIONS = 0
 
 # How long _close_session waits for an in-flight tool to finish before
 # force-closing pages. Long Playwright calls (e.g. goto with a big timeout)
@@ -91,6 +99,45 @@ _CLEANUP_TIMEOUT = 10.0
 _DIALOG_CAP = 50
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        _log.warning("invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+# 常驻服务的默认资源边界，可通过环境变量覆盖。
+_MAX_SESSIONS = _env_positive_int("SPECTRA_MCP_MAX_SESSIONS", 8)
+_MAX_PAGES_PER_SESSION = _env_positive_int(
+    "SPECTRA_MCP_MAX_PAGES_PER_SESSION", 32
+)
+_MAX_TEXT_CHARS = _env_positive_int("SPECTRA_MCP_MAX_TEXT_CHARS", 200000)
+_MAX_ELEMENT_RESULTS = _env_positive_int(
+    "SPECTRA_MCP_MAX_ELEMENT_RESULTS", 500
+)
+_MAX_TIMEOUT_MS = _env_positive_int("SPECTRA_MCP_MAX_TIMEOUT_MS", 300000)
+_MAX_DELAY_MS = _env_positive_int("SPECTRA_MCP_MAX_DELAY_MS", 10000)
+_MAX_CLICK_COUNT = _env_positive_int("SPECTRA_MCP_MAX_CLICK_COUNT", 10)
+_MAX_MOUSE_STEPS = _env_positive_int("SPECTRA_MCP_MAX_MOUSE_STEPS", 1000)
+_MAX_SCREENSHOT_BYTES = _env_positive_int(
+    "SPECTRA_MCP_MAX_SCREENSHOT_BYTES", 10 * 1024 * 1024
+)
+_MAX_SCREENSHOT_PIXELS = _env_positive_int(
+    "SPECTRA_MCP_MAX_SCREENSHOT_PIXELS", 50000000
+)
+_MAX_EVALUATE_RESULT_BYTES = _env_positive_int(
+    "SPECTRA_MCP_MAX_EVALUATE_RESULT_BYTES", 1024 * 1024
+)
+_DATA_ROOT = os.environ.get("SPECTRA_MCP_DATA_ROOT", "").strip()
+
+
 def _ok(**kw: Any) -> Dict[str, Any]:
     kw["ok"] = True
     return kw
@@ -102,11 +149,133 @@ def _err(msg: str, **kw: Any) -> Dict[str, Any]:
     return kw
 
 
+def _range_error(name: str, value: int, minimum: int, maximum: int) -> Optional[str]:
+    if value < minimum or value > maximum:
+        return f"{name} must be between {minimum} and {maximum}"
+    return None
+
+
+def _timeout_error(timeout_ms: int) -> Optional[str]:
+    return _range_error("timeout_ms", timeout_ms, 0, _MAX_TIMEOUT_MS)
+
+
+async def _await_with_timeout(awaitable: Any, timeout_ms: int) -> Any:
+    if timeout_ms == 0:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, timeout=timeout_ms / 1000)
+
+
+def _serialized_size(value: Any) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _resolve_data_path(path: str, *, must_exist: bool = False) -> Path:
+    target = Path(path).expanduser().resolve()
+    if _DATA_ROOT:
+        root = Path(_DATA_ROOT).expanduser().resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"path must stay within configured data root: {root}") from exc
+    if must_exist and not target.exists():
+        raise ValueError(f"path not found: {str(target)!r}")
+    return target
+
+
+def _write_private_json_atomic(target: Path, data: Any) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        if os.name != "nt":
+            os.chmod(target, 0o600)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _acquire_process_file_lock(path: Path) -> Any:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _release_process_file_lock(handle: Any) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+@asynccontextmanager
+async def _binary_cache_guard():
+    async with _BINARY_LOCK:
+        lock_path = Path(cache_root()) / ".spectra-mcp.lock"
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(_acquire_process_file_lock, lock_path)
+        )
+        try:
+            handle = await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            handle = await acquire_task
+            await asyncio.shield(
+                asyncio.to_thread(_release_process_file_lock, handle)
+            )
+            raise
+        try:
+            yield
+        finally:
+            await asyncio.shield(
+                asyncio.to_thread(_release_process_file_lock, handle)
+            )
+
+
 async def _get_session(session_id: str) -> _Session:
     async with _LOCK:
         s = _SESSIONS.get(session_id)
     if s is None:
         raise KeyError(f"unknown session_id: {session_id!r}")
+    if not s.ready:
+        raise KeyError(f"session {session_id!r} is not ready")
     if s.closed:
         raise KeyError(f"session {session_id!r} is closed")
     return s
@@ -116,7 +285,13 @@ def _active_page(session: _Session) -> Any:
     if session.active_page_id is None:
         raise RuntimeError("session has no active page; call new_page first")
     page = session.pages.get(session.active_page_id)
-    if page is None or page.is_closed():
+    if page is None:
+        raise RuntimeError("active page is gone; switch_page or new_page")
+    try:
+        closed = page.is_closed()
+    except Exception as exc:
+        raise RuntimeError(f"active page state check failed: {exc}") from exc
+    if closed:
         raise RuntimeError("active page is gone; switch_page or new_page")
     return page
 
@@ -154,6 +329,45 @@ def _alloc_pid(session: _Session) -> int:
     pid = session.next_page_id
     session.next_page_id += 1
     return pid
+
+
+def _tracked_page_id(session: _Session, page: Any) -> Optional[int]:
+    for pid, tracked in list(session.pages.items()):
+        if tracked is page:
+            return pid
+    return None
+
+
+def _track_page(session: _Session, page: Any, activate: bool = False) -> int:
+    existing = _tracked_page_id(session, page)
+    if existing is not None:
+        if activate:
+            session.active_page_id = existing
+        return existing
+    if len(session.pages) >= _MAX_PAGES_PER_SESSION:
+        raise RuntimeError(
+            f"page limit reached ({_MAX_PAGES_PER_SESSION} per session)"
+        )
+    pid = _alloc_pid(session)
+    session.pages[pid] = page
+    if activate:
+        session.active_page_id = pid
+    _register_page_handlers(session, page)
+    return pid
+
+
+def _close_untracked_page(page: Any) -> None:
+    async def _close() -> None:
+        try:
+            if not page.is_closed():
+                await page.close()
+        except Exception as exc:
+            _log.warning("failed to close untracked page: %s", exc)
+
+    task = asyncio.create_task(_close())
+    task.add_done_callback(
+        lambda done: done.exception() if not done.cancelled() else None
+    )
 
 
 def _context_of(session: _Session) -> Any:
@@ -223,10 +437,13 @@ def _on_popup(session: _Session, popup: Any) -> None:
     switch_page see it. Does NOT steal focus — active_page_id is unchanged. Also
     registers handlers on the popup so it can spawn its own popups."""
     if session.closed:
+        _close_untracked_page(popup)
         return
-    pid = _alloc_pid(session)
-    session.pages[pid] = popup
-    _register_page_handlers(session, popup)
+    try:
+        _track_page(session, popup)
+    except RuntimeError as exc:
+        _log.warning("popup rejected for session %s: %s", session.session_id, exc)
+        _close_untracked_page(popup)
 
 
 def _register_page_handlers(session: _Session, page: Any) -> None:
@@ -307,16 +524,44 @@ async def _make_page(session: _Session) -> Any:
     else:
         # Persistent BrowserContext path: new_page() shares the single context.
         page = await boc.new_page()
-    pid = _alloc_pid(session)
-    session.pages[pid] = page
-    session.active_page_id = pid
-    _register_page_handlers(session, page)
+    try:
+        pid = _track_page(session, page, activate=True)
+    except RuntimeError:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        raise
     return page, pid
 
 
-async def _run_cleanup(label: str, awaitable: Any, errors: List[str]) -> None:
+async def _initialize_session_page(session: _Session) -> Any:
+    if session.persistent:
+        existing_pages = list(getattr(session.browser_or_ctx, "pages", []))
+        first_page = None
+        first_pid = None
+        for page in existing_pages:
+            try:
+                if page.is_closed():
+                    continue
+                pid = _track_page(session, page, activate=first_page is None)
+            except RuntimeError:
+                _close_untracked_page(page)
+                continue
+            except Exception:
+                continue
+            if first_page is None:
+                first_page = page
+                first_pid = pid
+        if first_page is not None:
+            return first_page, first_pid
+    return await _make_page(session)
+
+
+async def _run_cleanup(label: str, awaitable: Any, errors: List[str]) -> bool:
     try:
         await asyncio.wait_for(awaitable, timeout=_CLEANUP_TIMEOUT)
+        return True
     except asyncio.TimeoutError:
         message = f"{label} timed out after {_CLEANUP_TIMEOUT:.1f}s"
         errors.append(message)
@@ -325,56 +570,102 @@ async def _run_cleanup(label: str, awaitable: Any, errors: List[str]) -> None:
         message = f"{label} failed: {exc}"
         errors.append(message)
         _log.warning("session cleanup: %s", message)
+    return False
 
 
 async def _close_session(session: _Session) -> List[str]:
-    if session.closed:
-        return []
-    # Set closed=True BEFORE closing pages so that in-flight tools force-closed
-    # mid-Playwright-call see s.closed=True in their except and return a clean
-    # _err("session closed") instead of raw Playwright noise.
-    session.closed = True
-    errors: List[str] = []
-    got_lock = False
-    try:
-        await asyncio.wait_for(session.lock.acquire(), timeout=_CLOSE_DRAIN_TIMEOUT)
-        got_lock = True
-    except asyncio.TimeoutError:
-        _log.warning(
-            "close_session %s: in-flight tool did not yield within %.1fs; "
-            "force-closing (best-effort: in-flight tail code may race with teardown)",
-            session.session_id, _CLOSE_DRAIN_TIMEOUT,
-        )
-    try:
-        for pid, page in list(session.pages.items()):
-            try:
-                closed = page.is_closed()
-            except Exception as exc:
-                message = f"page {pid} state check failed: {exc}"
-                _log.warning("session cleanup: %s", message)
-                closed = False
-            if not closed:
-                await _run_cleanup(f"page {pid} close", page.close(), errors)
-        if session.primary_context is not None:
-            await _run_cleanup(
-                "primary context close", session.primary_context.close(), errors
+    async with session.cleanup_lock:
+        if session.cleanup_complete:
+            return []
+        # closed 只表示拒绝新调用；cleanup_complete 才表示资源已经回收。
+        session.closed = True
+        session.ready = False
+        errors: List[str] = []
+        got_lock = False
+        try:
+            await asyncio.wait_for(
+                session.lock.acquire(), timeout=_CLOSE_DRAIN_TIMEOUT
             )
-        session.pages.clear()
-        await _run_cleanup(
-            "browser exit", session.ipw.__aexit__(None, None, None), errors
-        )
+            got_lock = True
+        except asyncio.TimeoutError:
+            _log.warning(
+                "close_session %s: in-flight tool did not yield within %.1fs; "
+                "force-closing (best-effort: in-flight tail code may race with teardown)",
+                session.session_id,
+                _CLOSE_DRAIN_TIMEOUT,
+            )
+        try:
+            for pid, page in list(session.pages.items()):
+                try:
+                    closed = page.is_closed()
+                except Exception as exc:
+                    message = f"page {pid} state check failed: {exc}"
+                    _log.warning("session cleanup: %s", message)
+                    closed = False
+                if closed:
+                    session.pages.pop(pid, None)
+                    continue
+                if await _run_cleanup(f"page {pid} close", page.close(), errors):
+                    session.pages.pop(pid, None)
+            if session.primary_context is not None:
+                if await _run_cleanup(
+                    "primary context close",
+                    session.primary_context.close(),
+                    errors,
+                ):
+                    session.primary_context = None
+            exited = await _run_cleanup(
+                "browser exit", session.ipw.__aexit__(None, None, None), errors
+            )
+            if exited:
+                session.cleanup_complete = True
+                session.pages.clear()
+                session.primary_context = None
+                session.active_page_id = None
+        finally:
+            if got_lock:
+                session.lock.release()
+        return errors
+
+
+async def _await_session_cleanup(session: _Session) -> List[str]:
+    task = session.cleanup_task
+    if task is None or task.done():
+        task = asyncio.create_task(_close_session(session))
+        session.cleanup_task = task
+    try:
+        return await asyncio.shield(task)
     finally:
-        if got_lock:
-            session.lock.release()
+        if task.done() and session.cleanup_task is task:
+            session.cleanup_task = None
+
+
+async def _remove_completed_session(session: _Session) -> None:
+    if not session.cleanup_complete:
+        return
+    async with _LOCK:
+        if _SESSIONS.get(session.session_id) is session:
+            _SESSIONS.pop(session.session_id, None)
+
+
+async def _retain_session_for_cleanup(session: _Session) -> None:
+    async with _LOCK:
+        _SESSIONS.setdefault(session.session_id, session)
+
+
+async def _cleanup_failed_start(session: _Session) -> List[str]:
+    await _retain_session_for_cleanup(session)
+    errors = await _await_session_cleanup(session)
+    await _remove_completed_session(session)
     return errors
 
 
 async def _close_all_sessions() -> None:
     async with _LOCK:
         sessions = list(_SESSIONS.values())
-        _SESSIONS.clear()
     for s in sessions:
-        errors = await _close_session(s)
+        errors = await _await_session_cleanup(s)
+        await _remove_completed_session(s)
         if errors:
             _log.warning(
                 "session %s closed with %d cleanup error(s)", s.session_id, len(errors)
@@ -462,8 +753,18 @@ async def fetch_binary(ctx: Context, force: bool = False) -> Dict[str, Any]:
         _log.info("fetch_binary phase=%s", phase)
         _emit(ctx.report_progress(0.0, None, phase))
 
-    async with _BINARY_LOCK:
+    async with _binary_cache_guard():
         try:
+            if force:
+                async with _LOCK:
+                    has_live_sessions = _STARTING_SESSIONS > 0 or any(
+                        not session.cleanup_complete
+                        for session in _SESSIONS.values()
+                    )
+                if has_live_sessions:
+                    return _err(
+                        "force fetch is unavailable while sessions are active or cleaning up"
+                    )
             vdir = cache_dir_for_version(BINARY_VERSION)
             if force and vdir.exists():
                 await ctx.info("force: removing existing cache dir")
@@ -543,14 +844,29 @@ async def start_session(
         re-authenticating. Non-persistent sessions only (cannot be combined with
         ``profile_dir``, whose on-disk profile already persists state).
     """
-    if storage_state_path:
+    global _STARTING_SESSIONS
+
+    if storage_state_path and profile_dir:
+        return _err(
+            "storage_state_path cannot be combined with profile_dir: a "
+            "persistent profile already persists cookies/localStorage"
+        )
+    try:
+        if storage_state_path:
+            storage_path = _resolve_data_path(storage_state_path, must_exist=True)
+            if not storage_path.is_file():
+                return _err(f"storage_state_path is not a file: {str(storage_path)!r}")
+            storage_state_path = str(storage_path)
         if profile_dir:
-            return _err(
-                "storage_state_path cannot be combined with profile_dir: a "
-                "persistent profile already persists cookies/localStorage"
-            )
-        if not os.path.isfile(storage_state_path):
-            return _err(f"storage_state_path not found: {storage_state_path!r}")
+            profile_dir = str(_resolve_data_path(profile_dir))
+    except ValueError as exc:
+        return _err(str(exc))
+
+    async with _LOCK:
+        if len(_SESSIONS) + _STARTING_SESSIONS >= _MAX_SESSIONS:
+            return _err(f"session limit reached ({_MAX_SESSIONS})")
+        _STARTING_SESSIONS += 1
+    reserved_slot = True
 
     proxy: Optional[Dict[str, str]] = None
     if proxy_server:
@@ -560,78 +876,112 @@ async def start_session(
         if proxy_password:
             proxy["password"] = proxy_password
 
-    try:
-        ipw = InvisiblePlaywright(
-            seed=seed,
-            headless=headless,
-            proxy=proxy,
-            humanize=humanize,
-            locale=locale or "auto",
-            timezone=timezone or "",
-            profile_dir=profile_dir or None,
-            prep_recaptcha=prep_recaptcha,
-        )
-    except Exception as exc:
-        return _err(f"launch setup failed: {exc}")
-
+    ipw = None
+    session = None
     sid = secrets.token_hex(8)
-    await ctx.info(f"launching session {sid} (seed={ipw.seed})")
     try:
-        browser_or_ctx = await ipw.__aenter__()
-    except Exception as exc:
         try:
-            await ipw.__aexit__(None, None, None)
-        except Exception:
-            pass
-        return _err(f"launch failed: {exc}")
+            ipw = InvisiblePlaywright(
+                seed=seed,
+                headless=headless,
+                proxy=proxy,
+                humanize=humanize,
+                locale=locale or "auto",
+                timezone=timezone or "",
+                profile_dir=profile_dir or None,
+                prep_recaptcha=prep_recaptcha,
+            )
+        except Exception as exc:
+            return _err(f"launch setup failed: {exc}")
 
-    persistent = not hasattr(browser_or_ctx, "new_context")
-    session = _Session(
-        session_id=sid,
-        ipw=ipw,
-        browser_or_ctx=browser_or_ctx,
-        seed=ipw.seed,
-        persistent=persistent,
-    )
-    session.storage_state_path = storage_state_path or None
-    try:
-        page, pid = await _make_page(session)
-    except Exception as exc:
-        cleanup_errors = await _close_session(session)
-        return _err(
-            f"initial page failed: {exc}", cleanup_errors=cleanup_errors
+        await ctx.info(f"launching session {sid} (seed={ipw.seed})")
+        try:
+            async with _binary_cache_guard():
+                browser_or_ctx = await ipw.__aenter__()
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(ipw.__aexit__(None, None, None))
+            except Exception:
+                pass
+            raise
+        except Exception as exc:
+            try:
+                await ipw.__aexit__(None, None, None)
+            except Exception:
+                pass
+            return _err(f"launch failed: {exc}")
+
+        persistent = not hasattr(browser_or_ctx, "new_context")
+        session = _Session(
+            session_id=sid,
+            ipw=ipw,
+            browser_or_ctx=browser_or_ctx,
+            seed=ipw.seed,
+            persistent=persistent,
+            ready=False,
         )
-    # Context now exists (primary_context on Browser path / the persistent context):
-    # register the session-wide dialog handler so no tab can freeze on alert().
-    _register_context_handlers(session)
+        session.storage_state_path = storage_state_path or None
+        async with _LOCK:
+            _SESSIONS[sid] = session
+            _STARTING_SESSIONS -= 1
+            reserved_slot = False
 
-    async with _LOCK:
-        _SESSIONS[sid] = session
+        try:
+            page, pid = await _initialize_session_page(session)
+            _register_context_handlers(session)
+            url = page.url
+            session.ready = True
+            await ctx.info(f"session {sid} ready, page_id={pid}")
+        except asyncio.CancelledError:
+            await _cleanup_failed_start(session)
+            raise
+        except Exception as exc:
+            cleanup_errors = await _cleanup_failed_start(session)
+            return _err(
+                f"initial session setup failed: {exc}",
+                session_id=sid,
+                cleanup_errors=cleanup_errors,
+                cleanup_pending=not session.cleanup_complete,
+            )
 
-    await ctx.info(f"session {sid} ready, page_id={pid}")
-    return _ok(
-        session_id=sid,
-        seed=ipw.seed,
-        persistent=persistent,
-        page_id=pid,
-        url=page.url,
-    )
+        return _ok(
+            session_id=sid,
+            seed=ipw.seed,
+            persistent=persistent,
+            page_id=pid,
+            url=url,
+        )
+    finally:
+        if reserved_slot:
+            async with _LOCK:
+                _STARTING_SESSIONS -= 1
 
 
 @mcp.tool()
 async def close_session(session_id: str, ctx: Context) -> Dict[str, Any]:
-    """Close a browser session and free its Firefox process."""
+    """Close a browser session and free its Firefox process.
+
+    Failed cleanup remains registered internally so calling this tool again can
+    retry resource recovery.
+    """
     async with _LOCK:
-        session = _SESSIONS.pop(session_id, None)
+        session = _SESSIONS.get(session_id)
     if session is None:
         return _err(f"unknown session_id: {session_id!r}")
-    cleanup_errors = await _close_session(session)
+    cleanup_errors = await _await_session_cleanup(session)
+    await _remove_completed_session(session)
     await ctx.info(f"closed session {session_id}")
     if cleanup_errors:
         return _err(
-            "session closed but cleanup failed",
+            "session cleanup reported errors",
             session_id=session_id,
             cleanup_errors=cleanup_errors,
+            cleanup_complete=session.cleanup_complete,
+        )
+    if not session.cleanup_complete:
+        return _err(
+            "session cleanup incomplete; retry close_session",
+            session_id=session_id,
         )
     return _ok(session_id=session_id)
 
@@ -649,7 +999,7 @@ async def list_sessions(ctx: Context) -> Dict[str, Any]:
                 "active_page_id": s.active_page_id,
             }
             for s in _SESSIONS.values()
-            if not s.closed
+            if s.ready and not s.closed
         ]
     return _ok(sessions=items)
 
@@ -764,10 +1114,15 @@ async def switch_page(session_id: str, page_id: int, ctx: Context) -> Dict[str, 
             return _err("session closed")
         if page_id not in s.pages:
             return _err(f"unknown page_id: {page_id}")
-        if s.pages[page_id].is_closed():
-            return _err(f"page {page_id} is closed")
+        page = s.pages[page_id]
+        try:
+            if page.is_closed():
+                return _err(f"page {page_id} is closed")
+            url = page.url
+        except Exception as exc:
+            return _pw_err(s, "switch_page", exc)
         s.active_page_id = page_id
-        return _ok(active_page_id=page_id, url=s.pages[page_id].url)
+        return _ok(active_page_id=page_id, url=url)
 
 
 # --------------------------------------------------------------------------- #
@@ -807,12 +1162,14 @@ async def goto(
     url: str,
     ctx: Context,
     timeout_ms: int = 30000,
-    wait_until: str = "load",
+    wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = "load",
 ) -> Dict[str, Any]:
     """Navigate the active page to ``url``.
 
     ``wait_until``: ``load`` | ``domcontentloaded`` | ``networkidle`` | ``commit``.
     """
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -839,6 +1196,8 @@ async def goto(
 @mcp.tool()
 async def go_forward(session_id: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     """Navigate the active page forward by one browser-history entry."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -851,8 +1210,15 @@ async def go_forward(session_id: str, ctx: Context, timeout_ms: int = 30000) -> 
 
 
 @mcp.tool()
-async def reload(session_id: str, ctx: Context, timeout_ms: int = 30000, wait_until: str = "load") -> Dict[str, Any]:
+async def reload(
+    session_id: str,
+    ctx: Context,
+    timeout_ms: int = 30000,
+    wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = "load",
+) -> Dict[str, Any]:
     """Reload the active page and wait for the requested lifecycle state."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -876,10 +1242,14 @@ async def click(
     selector: str,
     ctx: Context,
     timeout_ms: int = 30000,
-    button: str = "left",
+    button: Literal["left", "middle", "right"] = "left",
     click_count: int = 1,
 ) -> Dict[str, Any]:
     """Click an element matched by ``selector`` (humanized Bezier mouse path)."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
+    if error := _range_error("click_count", click_count, 1, _MAX_CLICK_COUNT):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -900,6 +1270,8 @@ async def fill(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Clear and fill an input/textarea with ``value`` (atomic, not per-keystroke)."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -921,6 +1293,10 @@ async def type_text(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Type ``text`` into an element one keystroke at a time (use for key-by-key input)."""
+    if error := _range_error("delay_ms", delay_ms, 0, _MAX_DELAY_MS):
+        return _err(error)
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -941,6 +1317,8 @@ async def press_key(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Focus ``selector`` and press a keyboard ``key`` (e.g. ``Enter``, ``Tab``, ``ArrowDown``)."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -975,6 +1353,8 @@ async def select_option(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Select an ``<option>`` by value in a ``<select>``."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -994,6 +1374,8 @@ async def hover(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Hover an element (humanized mouse path)."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1008,6 +1390,8 @@ async def hover(
 @mcp.tool()
 async def focus(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     """Focus the first element matching ``selector``."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1022,6 +1406,8 @@ async def focus(session_id: str, selector: str, ctx: Context, timeout_ms: int = 
 @mcp.tool()
 async def check(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     """Check a checkbox/radio matched by ``selector``."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1036,6 +1422,8 @@ async def check(session_id: str, selector: str, ctx: Context, timeout_ms: int = 
 @mcp.tool()
 async def uncheck(session_id: str, selector: str, ctx: Context, timeout_ms: int = 30000) -> Dict[str, Any]:
     """Uncheck a checkbox matched by ``selector``."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1061,8 +1449,9 @@ async def scroll(
             try:
                 if selector:
                     el = await page.query_selector(selector)
-                    if el is not None:
-                        await el.scroll_into_view_if_needed()
+                    if el is None:
+                        return _err(f"no element matches {selector!r}")
+                    await el.scroll_into_view_if_needed()
                 await page.mouse.wheel(dx, dy)
             except Exception as exc:
                 return _pw_err(s, "scroll", exc)
@@ -1084,8 +1473,8 @@ async def get_text(
     max_chars: int = 20000,
 ) -> Dict[str, Any]:
     """Get visible text. Empty ``selector`` = the whole body. Output is capped to ``max_chars``."""
-    if max_chars < 0:
-        return _err("max_chars must be >= 0")
+    if error := _range_error("max_chars", max_chars, 0, _MAX_TEXT_CHARS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1112,8 +1501,8 @@ async def get_html(
     max_chars: int = 20000,
 ) -> Dict[str, Any]:
     """Get HTML. Empty ``selector`` = full document (``page.content()``). Capped to ``max_chars``."""
-    if max_chars < 0:
-        return _err("max_chars must be >= 0")
+    if error := _range_error("max_chars", max_chars, 0, _MAX_TEXT_CHARS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1163,8 +1552,10 @@ async def query_elements(
     placeholder, visible flag and bounding rect. Useful for the LLM to decide
     what to click next without scraping raw HTML.
     """
-    if max_results < 0:
-        return _err("max_results must be >= 0")
+    if error := _range_error(
+        "max_results", max_results, 0, _MAX_ELEMENT_RESULTS
+    ):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1184,8 +1575,8 @@ async def is_visible(
     timeout_ms: int = 5000,
 ) -> Dict[str, Any]:
     """Check whether ``selector`` matches a visible element (with a short wait)."""
-    if timeout_ms < 0:
-        return _err("timeout_ms must be >= 0")
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1210,7 +1601,7 @@ async def screenshot(
     session_id: str,
     ctx: Context,
     full_page: bool = False,
-    image_format: str = "jpeg",
+    image_format: Literal["jpeg", "jpg", "png"] = "jpeg",
     quality: int = 85,
 ) -> Image:
     """Capture a screenshot of the active page and return it as image content.
@@ -1229,12 +1620,33 @@ async def screenshot(
     try:
         async with _use_page(session_id) as (s, page):
             try:
+                if full_page:
+                    dimensions = await page.evaluate(
+                        """() => {
+                          const d = document.documentElement;
+                          const b = document.body;
+                          return {
+                            width: Math.max(d.scrollWidth, b ? b.scrollWidth : 0),
+                            height: Math.max(d.scrollHeight, b ? b.scrollHeight : 0)
+                          };
+                        }"""
+                    )
+                    pixels = int(dimensions["width"]) * int(dimensions["height"])
+                    if pixels > _MAX_SCREENSHOT_PIXELS:
+                        raise RuntimeError(
+                            "full-page screenshot exceeds pixel limit "
+                            f"({_MAX_SCREENSHOT_PIXELS})"
+                        )
                 if fmt == "png":
                     data = await page.screenshot(full_page=full_page, type="png")
                     mime = "png"
                 else:
                     data = await page.screenshot(full_page=full_page, type="jpeg", quality=quality)
                     mime = "jpeg"
+                if len(data) > _MAX_SCREENSHOT_BYTES:
+                    raise RuntimeError(
+                        f"screenshot exceeds byte limit ({_MAX_SCREENSHOT_BYTES})"
+                    )
             except Exception as exc:
                 raise RuntimeError("session closed" if s.closed else f"screenshot failed: {exc}") from exc
             await ctx.debug(f"screenshot fmt={mime} full_page={full_page} bytes={len(data)}")
@@ -1254,19 +1666,26 @@ async def wait_for_selector(
     selector: str,
     ctx: Context,
     timeout_ms: int = 30000,
-    state: str = "visible",
+    state: Literal["attached", "detached", "hidden", "visible"] = "visible",
 ) -> Dict[str, Any]:
     """Wait until an element matching ``selector`` reaches ``state``.
 
     ``state``: ``visible`` | ``hidden`` | ``attached`` | ``detached``.
     """
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
                 el = await page.wait_for_selector(selector, timeout=timeout_ms, state=state)
             except Exception as exc:
                 return _pw_err(s, "wait_for_selector", exc)
-            return _ok(selector=selector, state=state, matched=el is not None)
+            return _ok(
+                selector=selector,
+                state=state,
+                reached=True,
+                element_present=el is not None,
+            )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1274,6 +1693,8 @@ async def wait_for_selector(
 @mcp.tool()
 async def wait_for_timeout(session_id: str, ms: int, ctx: Context) -> Dict[str, Any]:
     """Sleep for ``ms`` milliseconds (used to let async page updates settle)."""
+    if error := _range_error("ms", ms, 0, _MAX_TIMEOUT_MS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1303,18 +1724,20 @@ async def evaluate(
     ``script`` is evaluated as an async function body receiving ``arg``:
     e.g. ``async (arg) => { return document.title; }`` or a plain expression.
 
-    ``timeout_ms`` bounds how long the server waits for the script to return.
-    Playwright has no native evaluate timeout, so this is enforced via
+    ``timeout_ms`` bounds how long the server waits for the script to return;
+    ``0`` disables the server timeout. Positive values are enforced via
     ``asyncio.wait_for``. Note: on timeout the Python-side await is cancelled
     but the JS keeps running in the browser — the page may be left
     unresponsive (its main thread occupied). Call ``close_page`` then
     ``new_page`` to recover. Use sparingly — arbitrary JS is powerful.
     """
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
-                result = await asyncio.wait_for(
-                    page.evaluate(script, arg), timeout=timeout_ms / 1000
+                result = await _await_with_timeout(
+                    page.evaluate(script, arg), timeout_ms
                 )
             except asyncio.TimeoutError:
                 return _err(
@@ -1323,6 +1746,15 @@ async def evaluate(
                 )
             except Exception as exc:
                 return _pw_err(s, "evaluate", exc)
+            try:
+                result_size = _serialized_size(result)
+            except (TypeError, ValueError) as exc:
+                return _err(f"evaluate returned a non-serializable result: {exc}")
+            if result_size > _MAX_EVALUATE_RESULT_BYTES:
+                return _err(
+                    "evaluate result exceeds byte limit "
+                    f"({_MAX_EVALUATE_RESULT_BYTES})"
+                )
             return _ok(result=result)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
@@ -1351,6 +1783,8 @@ async def mouse_drag(
     Note: on the patched anti-detect build, hold-drag only works when the session
     was started with ``humanize=False`` (the humanized mouse can't hold-and-drag).
     """
+    if error := _range_error("steps", steps, 1, _MAX_MOUSE_STEPS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             pressed = False
@@ -1358,7 +1792,7 @@ async def mouse_drag(
                 await page.mouse.move(from_x, from_y)
                 await page.mouse.down()
                 pressed = True
-                await page.mouse.move(to_x, to_y, steps=max(1, steps))
+                await page.mouse.move(to_x, to_y, steps=steps)
                 await page.mouse.up()
                 pressed = False
             except Exception as exc:
@@ -1375,7 +1809,7 @@ async def mouse_drag(
             return _ok(
                 from_xy=[from_x, from_y],
                 to_xy=[to_x, to_y],
-                steps=max(1, steps),
+                steps=steps,
             )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
@@ -1390,10 +1824,12 @@ async def mouse_move(
     steps: int = 1,
 ) -> Dict[str, Any]:
     """Move the mouse to viewport coordinate (x, y) over ``steps`` intermediate moves."""
+    if error := _range_error("steps", steps, 1, _MAX_MOUSE_STEPS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
-                await page.mouse.move(x, y, steps=max(1, steps))
+                await page.mouse.move(x, y, steps=steps)
             except Exception as exc:
                 return _pw_err(s, "mouse_move", exc)
             return _ok(x=x, y=y)
@@ -1407,7 +1843,7 @@ async def mouse_click(
     x: float,
     y: float,
     ctx: Context,
-    button: str = "left",
+    button: Literal["left", "middle", "right"] = "left",
     click_count: int = 1,
 ) -> Dict[str, Any]:
     """Click at viewport coordinate (x, y) — for canvas/SVG/custom controls (no selector).
@@ -1415,6 +1851,8 @@ async def mouse_click(
     Coordinates are viewport pixels; read them from ``screenshot`` or the ``rect``
     fields of ``query_elements``. Combine with ``keyboard_down``/``keyboard_up`` for
     Shift/Ctrl+click."""
+    if error := _range_error("click_count", click_count, 1, _MAX_CLICK_COUNT):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1473,6 +1911,8 @@ async def keyboard_type(
 
     Complements ``type_text`` (which targets a selector). Use after focusing via
     ``mouse_click`` / ``focus`` — handy for canvas or custom widgets."""
+    if error := _range_error("delay_ms", delay_ms, 0, _MAX_DELAY_MS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1493,7 +1933,7 @@ async def keyboard_type(
 async def set_dialog_handler(
     session_id: str,
     ctx: Context,
-    action: str = "accept",
+    action: Literal["accept", "dismiss"] = "accept",
     prompt_text: str = "",
 ) -> Dict[str, Any]:
     """Set how JS dialogs are auto-handled for this session.
@@ -1556,23 +1996,25 @@ async def wait_for_page(
     pass the page ids you already had (``known_page_ids``, e.g. from ``session_info``
     before the click) so an already-open popup is returned immediately; otherwise
     the current pages form the baseline and only strictly-new tabs are reported."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_ms / 1000
+    deadline = None if timeout_ms == 0 else loop.time() + timeout_ms / 1000
     async with s.lock:
         if s.closed:
             return _err("session closed")
         baseline = set(known_page_ids) if known_page_ids is not None else set(s.pages.keys())
         while True:
-            new = [pid for pid in s.pages.keys() if pid not in baseline]
+            new = [pid for pid in list(s.pages.keys()) if pid not in baseline]
             if new:
                 return _ok(new_page_ids=sorted(new), active_page_id=s.active_page_id)
             if s.closed:
                 return _err("session closed")
-            if loop.time() >= deadline:
+            if deadline is not None and loop.time() >= deadline:
                 return _err("wait_for_page timed out")
             await asyncio.sleep(0.15)
 
@@ -1662,6 +2104,10 @@ async def save_storage_state(session_id: str, path: str, ctx: Context) -> Dict[s
     if not path:
         return _err("path is required")
     try:
+        target = _resolve_data_path(path)
+    except ValueError as exc:
+        return _err(str(exc))
+    try:
         s = await _get_session(session_id)
     except KeyError as exc:
         return _err(str(exc))
@@ -1672,13 +2118,11 @@ async def save_storage_state(session_id: str, path: str, ctx: Context) -> Dict[s
         if c is None:
             return _err("no browser context available")
         try:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            await c.storage_state(path=path)
+            state = await c.storage_state()
+            await asyncio.to_thread(_write_private_json_atomic, target, state)
         except Exception as exc:
             return _pw_err(s, "save_storage_state", exc)
-        return _ok(path=path)
+        return _ok(path=str(target))
 
 
 # --------------------------------------------------------------------------- #
@@ -1765,6 +2209,8 @@ async def frame_click(
     ``frame_selector`` is a CSS selector for the ``<iframe>`` (chain nested frames
     with ``>>>``); discover it via ``list_frames``. Ideal for reCAPTCHA checkboxes
     and payment widgets living in cross-origin frames."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1786,6 +2232,8 @@ async def frame_fill(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Clear and fill ``selector`` inside the iframe ``frame_selector`` with ``value``."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1808,6 +2256,10 @@ async def frame_type(
     timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     """Type ``text`` key-by-key into ``selector`` inside the iframe ``frame_selector``."""
+    if error := _range_error("delay_ms", delay_ms, 0, _MAX_DELAY_MS):
+        return _err(error)
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1831,8 +2283,8 @@ async def frame_get_text(
     """Get inner text of ``selector`` inside the iframe ``frame_selector``.
 
     Defaults to the frame's whole ``body``. Output is capped to ``max_chars``."""
-    if max_chars < 0:
-        return _err("max_chars must be >= 0")
+    if error := _range_error("max_chars", max_chars, 0, _MAX_TEXT_CHARS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1853,11 +2305,13 @@ async def frame_wait_for_selector(
     selector: str,
     ctx: Context,
     timeout_ms: int = 30000,
-    state: str = "visible",
+    state: Literal["attached", "detached", "hidden", "visible"] = "visible",
 ) -> Dict[str, Any]:
     """Wait until ``selector`` inside the iframe ``frame_selector`` reaches ``state``.
 
     ``state``: ``visible`` | ``hidden`` | ``attached`` | ``detached``."""
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1865,7 +2319,12 @@ async def frame_wait_for_selector(
                 await loc.first.wait_for(timeout=timeout_ms, state=state)
             except Exception as exc:
                 return _pw_err(s, "frame_wait_for_selector", exc)
-            return _ok(frame_selector=frame_selector, selector=selector, state=state)
+            return _ok(
+                frame_selector=frame_selector,
+                selector=selector,
+                state=state,
+                reached=True,
+            )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1883,8 +2342,10 @@ async def frame_query_elements(
     Same shape as ``query_elements`` but frame-aware (the page-level version can't
     see into iframes). ``frame_selector`` is the iframe CSS selector chain
     (``>>>`` for nesting); the frames must already be present on the page."""
-    if max_results < 0:
-        return _err("max_results must be >= 0")
+    if error := _range_error(
+        "max_results", max_results, 0, _MAX_ELEMENT_RESULTS
+    ):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1913,17 +2374,19 @@ async def frame_evaluate(
     payment iframe's hidden token). ``script`` is evaluated as a function body
     receiving ``arg``; e.g. ``() => document.title``.
 
-    ``timeout_ms`` bounds the server wait (Playwright has no native evaluate
-    timeout, so this is enforced via ``asyncio.wait_for``). On timeout the JS
+    ``timeout_ms`` bounds the server wait; ``0`` disables the server timeout,
+    while positive values use ``asyncio.wait_for``. On timeout the JS
     keeps running in the frame and the frame may be left unresponsive — recover
     with ``close_page`` + ``new_page``. Use sparingly.
     """
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
                 frame = await _resolve_frame(page, frame_selector)
-                result = await asyncio.wait_for(
-                    frame.evaluate(script, arg), timeout=timeout_ms / 1000
+                result = await _await_with_timeout(
+                    frame.evaluate(script, arg), timeout_ms
                 )
             except asyncio.TimeoutError:
                 return _err(
@@ -1932,6 +2395,17 @@ async def frame_evaluate(
                 )
             except Exception as exc:
                 return _pw_err(s, "frame_evaluate", exc)
+            try:
+                result_size = _serialized_size(result)
+            except (TypeError, ValueError) as exc:
+                return _err(
+                    f"frame_evaluate returned a non-serializable result: {exc}"
+                )
+            if result_size > _MAX_EVALUATE_RESULT_BYTES:
+                return _err(
+                    "frame_evaluate result exceeds byte limit "
+                    f"({_MAX_EVALUATE_RESULT_BYTES})"
+                )
             return _ok(result=result)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
@@ -1950,8 +2424,8 @@ async def frame_get_html(
     Empty ``selector`` = the frame's full content (``frame.content()``);
     otherwise the matched element's ``outerHTML``. Capped to ``max_chars``.
     """
-    if max_chars < 0:
-        return _err("max_chars must be >= 0")
+    if error := _range_error("max_chars", max_chars, 0, _MAX_TEXT_CHARS):
+        return _err(error)
     try:
         async with _use_page(session_id) as (s, page):
             try:
