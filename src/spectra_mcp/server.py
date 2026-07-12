@@ -62,6 +62,19 @@ _log.propagate = False
 
 
 @dataclass
+class _RefTarget:
+    page_id: int
+    top_url: str
+    frame_id: str
+    frame_url: str
+    realm: Any  # Page for the main frame, Frame for child frames
+    selector: str
+    tag: str
+    role: str
+    name: str
+
+
+@dataclass
 class _Session:
     session_id: str
     ipw: InvisiblePlaywright
@@ -87,7 +100,7 @@ class _Session:
     _ctx_handlers_done: bool = False  # idempotency guard for context.on("dialog")
     ref_page_id: Optional[int] = None
     ref_url: str = ""
-    ref_selectors: Dict[str, str] = field(default_factory=dict)
+    ref_targets: Dict[str, _RefTarget] = field(default_factory=dict)
 
 
 _SESSIONS: Dict[str, _Session] = {}
@@ -146,6 +159,8 @@ _MAX_EVALUATE_RESULT_BYTES = _env_positive_int(
 )
 _DEFAULT_PAGE_CHARS = _env_positive_int("SPECTRA_MCP_DEFAULT_PAGE_CHARS", 8000)
 _MAX_FORM_FIELDS = _env_positive_int("SPECTRA_MCP_MAX_FORM_FIELDS", 50)
+_MAX_SNAPSHOT_FRAMES = _env_positive_int("SPECTRA_MCP_MAX_SNAPSHOT_FRAMES", 32)
+_MAX_FRAME_DEPTH = _env_positive_int("SPECTRA_MCP_MAX_FRAME_DEPTH", 8)
 _DATA_ROOT = os.environ.get("SPECTRA_MCP_DATA_ROOT", "").strip()
 
 
@@ -211,9 +226,11 @@ class SnapshotResult(ToolResult):
     url: str
     title: str
     count: int
+    frame_count: int
     truncated: bool
     snapshot: str
     elements: List[Dict[str, Any]]
+    frames: List[Dict[str, Any]]
 
 
 class ActionResult(ToolResult):
@@ -568,7 +585,8 @@ _SNAPSHOT_JS = r"""
     const role = roleOf(el);
     const type = (el.getAttribute('type') || '').toLowerCase();
     const item = {
-      selector: cssPath(el), role, name: nameOf(el).replace(/\s+/g, ' ').slice(0, 160),
+      selector: cssPath(el), tag: el.tagName.toLowerCase(), role,
+      name: nameOf(el).replace(/\s+/g, ' ').slice(0, 160),
       disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
       checked: ('checked' in el) ? !!el.checked : null,
       selected: ('selected' in el) ? !!el.selected : null,
@@ -576,14 +594,69 @@ _SNAPSHOT_JS = r"""
     };
     out.push(item);
   }
-  return {title: document.title, url: location.href, items: out, total_candidates: candidates.length};
+  const childFrames = Array.from(document.querySelectorAll('iframe')).map(el => {
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return {
+      id: el.id || null,
+      name: el.getAttribute('name'),
+      title: el.getAttribute('title'),
+      aria_label: el.getAttribute('aria-label'),
+      src: el.getAttribute('src'),
+      visible: style.visibility !== 'hidden' && style.display !== 'none' && !!(r.width || r.height),
+      rect: {x: r.x, y: r.y, w: r.width, h: r.height}
+    };
+  });
+  return {title: document.title, url: location.href, items: out,
+    total_candidates: candidates.length, child_frames: childFrames};
 }
 """
 
 
-def _snapshot_ref(page_id: int, selector: str) -> str:
-    digest = hashlib.sha1(f"{page_id}:{selector}".encode()).hexdigest()[:8]
-    return f"e{digest}"
+_REF_IDENTITY_JS = r"""
+(el) => {
+  const role = el.getAttribute('role') || ({
+    A: 'link', BUTTON: 'button', INPUT: (el.type === 'checkbox' ? 'checkbox' :
+      el.type === 'radio' ? 'radio' : el.type === 'submit' ? 'button' : 'textbox'),
+    TEXTAREA: 'textbox', SELECT: 'combobox', SUMMARY: 'button',
+    H1: 'heading', H2: 'heading', H3: 'heading'
+  }[el.tagName] || el.tagName.toLowerCase());
+  const labelled = el.getAttribute('aria-label');
+  let name = labelled || '';
+  if (!name) {
+    const by = el.getAttribute('aria-labelledby');
+    if (by) name = by.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' ').trim();
+  }
+  if (!name && el.labels?.length) name = Array.from(el.labels).map(x => x.innerText || '').join(' ').trim();
+  if (!name) name = (el.innerText || el.getAttribute('placeholder') ||
+    el.getAttribute('title') || el.getAttribute('name') || '').trim();
+  const r = el.getBoundingClientRect();
+  const style = getComputedStyle(el);
+  return {
+    tag: el.tagName.toLowerCase(), role,
+    name: name.replace(/\s+/g, ' ').slice(0, 160),
+    visible: style.visibility !== 'hidden' && style.display !== 'none' && !!(r.width || r.height)
+  };
+}
+"""
+
+
+def _snapshot_ref(page_id: int, frame_id: str, selector: str) -> str:
+    digest = hashlib.sha1(f"{page_id}:{frame_id}:{selector}".encode()).hexdigest()[:8]
+    return f"{frame_id}:e{digest}" if frame_id != "main" else f"e{digest}"
+
+
+def _frame_depth(frame: Any) -> int:
+    depth = 1
+    parent = getattr(frame, "parent_frame", None)
+    while (
+        parent is not None
+        and getattr(parent, "parent_frame", None) is not None
+        and depth <= _MAX_FRAME_DEPTH
+    ):
+        depth += 1
+        parent = getattr(parent, "parent_frame", None)
+    return depth
 
 
 async def _snapshot_page(
@@ -591,59 +664,221 @@ async def _snapshot_page(
 ) -> Dict[str, Any]:
     if error := _range_error("max_elements", max_elements, 1, _MAX_ELEMENT_RESULTS):
         return _err(error)
-    raw = await page.evaluate(_SNAPSHOT_JS, max_elements)
     page_id = _tracked_page_id(session, page)
     if page_id is None:
         return _err("active page is not tracked")
-    refs: Dict[str, str] = {}
-    elements = []
-    lines = []
-    for item in raw.get("items", []):
-        selector = item["selector"]
-        ref = _snapshot_ref(page_id, selector)
-        suffix = 2
-        base_ref = ref
-        while ref in refs and refs[ref] != selector:
-            ref = f"{base_ref}_{suffix}"
-            suffix += 1
-        refs[ref] = selector
-        element = {"ref": ref, **{key: value for key, value in item.items() if key != "selector"}}
-        elements.append(element)
-        state = []
-        for key in ("disabled", "checked", "selected"):
-            if element.get(key) not in (None, False):
-                state.append(key)
-        value = element.get("value")
-        value_part = f' value="{value}"' if value else ""
-        state_part = f" [{' '.join(state)}]" if state else ""
-        lines.append(
-            f'- {element["role"]} "{element["name"]}" [ref={ref}]'
-            f"{value_part}{state_part}"
+    main_frame = getattr(page, "main_frame", None)
+    child_frames = [
+        frame
+        for frame in list(getattr(page, "frames", []) or [])
+        if frame is not main_frame
+    ]
+    child_frames.sort(key=_frame_depth)
+    frames_truncated = len(child_frames) > _MAX_SNAPSHOT_FRAMES
+    child_frames = child_frames[:_MAX_SNAPSHOT_FRAMES]
+    frame_ids = {id(frame): f"f{index}" for index, frame in enumerate(child_frames, 1)}
+    realms = [
+        {
+            "frame_id": "main",
+            "parent_id": None,
+            "depth": 0,
+            "name": "",
+            "url": page.url,
+            "realm": page,
+        }
+    ]
+    for frame in child_frames:
+        depth = _frame_depth(frame)
+        if depth > _MAX_FRAME_DEPTH:
+            frames_truncated = True
+            continue
+        parent = getattr(frame, "parent_frame", None)
+        parent_id = "main" if parent is main_frame else frame_ids.get(id(parent), "main")
+        realms.append(
+            {
+                "frame_id": frame_ids[id(frame)],
+                "parent_id": parent_id,
+                "depth": depth,
+                "name": getattr(frame, "name", "") or "",
+                "url": getattr(frame, "url", "") or "",
+                "realm": frame,
+            }
         )
+
+    targets: Dict[str, _RefTarget] = {}
+    elements: List[Dict[str, Any]] = []
+    frames_info: List[Dict[str, Any]] = []
+    lines: List[str] = []
+    top_title = ""
+    top_url = page.url
+    truncated = frames_truncated
+    child_count = max(0, len(realms) - 1)
+    child_budget = (
+        max(1, max_elements // (child_count + 2))
+        if child_count and max_elements > 1
+        else 0
+    )
+    child_total = min(max_elements - 1, child_budget * child_count)
+    main_budget = max_elements - child_total
+    remaining_child_budget = child_total
+    for descriptor in realms:
+        frame_id = descriptor["frame_id"]
+        realm = descriptor["realm"]
+        if frame_id == "main":
+            realm_budget = main_budget
+        else:
+            realm_budget = min(child_budget, remaining_child_budget)
+            remaining_child_budget -= realm_budget
+        frame_indent = "  " * max(0, descriptor["depth"] - 1)
+        frame_label = descriptor["name"] or descriptor["url"] or frame_id
+        frame_line_index: Optional[int] = None
+        if frame_id != "main":
+            frame_line_index = len(lines)
+            lines.append(f'{frame_indent}- iframe "{frame_label}" [frame={frame_id}]')
+        try:
+            raw = await realm.evaluate(_SNAPSHOT_JS, realm_budget)
+        except Exception as exc:
+            if frame_id == "main":
+                raise
+            if frame_line_index is not None:
+                lines[frame_line_index] = (
+                    f'{frame_indent}- iframe "{frame_label}" '
+                    f"[frame={frame_id} inaccessible]"
+                )
+            frames_info.append(
+                {
+                    "frame_id": frame_id,
+                    "parent_id": descriptor["parent_id"],
+                    "name": descriptor["name"],
+                    "url": descriptor["url"],
+                    "element": descriptor.get("element"),
+                    "count": 0,
+                    "accessible": False,
+                    "error": _sanitize_message(exc),
+                }
+            )
+            continue
+        if frame_id == "main":
+            top_title = raw.get("title", "")
+            top_url = raw.get("url", page.url)
+        direct_children = [
+            child for child in realms if child["parent_id"] == frame_id
+        ]
+        for child, metadata in zip(direct_children, raw.get("child_frames", [])):
+            child["element"] = metadata
+            child["name"] = (
+                child["name"]
+                or metadata.get("aria_label")
+                or metadata.get("title")
+                or metadata.get("name")
+                or ""
+            )
+            child["url"] = child["url"] or metadata.get("src") or ""
+        frame_elements = []
+        for item in raw.get("items", []):
+            selector = item["selector"]
+            ref = _snapshot_ref(page_id, frame_id, selector)
+            suffix = 2
+            base_ref = ref
+            while ref in targets and targets[ref].selector != selector:
+                ref = f"{base_ref}_{suffix}"
+                suffix += 1
+            target = _RefTarget(
+                page_id=page_id,
+                top_url=top_url,
+                frame_id=frame_id,
+                frame_url=raw.get("url", descriptor["url"]),
+                realm=realm,
+                selector=selector,
+                tag=str(item.get("tag") or ""),
+                role=str(item.get("role") or ""),
+                name=str(item.get("name") or ""),
+            )
+            targets[ref] = target
+            element = {
+                "ref": ref,
+                "frame_id": frame_id,
+                "frame_url": target.frame_url,
+                **{key: value for key, value in item.items() if key != "selector"},
+            }
+            elements.append(element)
+            frame_elements.append(element)
+            state = []
+            for key in ("disabled", "checked", "selected"):
+                if element.get(key) not in (None, False):
+                    state.append(key)
+            value = element.get("value")
+            value_part = f' value="{value}"' if value else ""
+            state_part = f" [{' '.join(state)}]" if state else ""
+            indent = "  " * descriptor["depth"]
+            lines.append(
+                f'{indent}- {element["role"]} "{element["name"]}" [ref={ref}]'
+                f"{value_part}{state_part}"
+            )
+        truncated = truncated or raw.get("total_candidates", len(frame_elements)) > len(frame_elements)
+        if frame_id != "main":
+            frames_info.append(
+                {
+                    "frame_id": frame_id,
+                    "parent_id": descriptor["parent_id"],
+                    "name": descriptor["name"],
+                    "url": raw.get("url", descriptor["url"]),
+                    "element": descriptor.get("element"),
+                    "title": raw.get("title", ""),
+                    "count": len(frame_elements),
+                    "accessible": True,
+                }
+            )
     session.ref_page_id = page_id
-    session.ref_url = raw.get("url", page.url)
-    session.ref_selectors = refs
-    truncated = raw.get("total_candidates", len(elements)) > len(elements)
+    session.ref_url = top_url
+    session.ref_targets = targets
     return _ok(
         session_id=session.session_id,
         page_id=page_id,
-        url=raw.get("url", page.url),
-        title=raw.get("title", ""),
+        url=top_url,
+        title=top_title,
         count=len(elements),
+        frame_count=len(frames_info),
         truncated=truncated,
         snapshot="\n".join(lines),
         elements=elements,
+        frames=frames_info,
     )
 
 
-def _selector_for_ref(session: _Session, page: Any, ref: str) -> str:
+async def _locator_for_ref(session: _Session, page: Any, ref: str) -> Any:
     page_id = _tracked_page_id(session, page)
     if session.ref_page_id != page_id or session.ref_url != page.url:
         raise RuntimeError("snapshot is stale; call browser_snapshot again")
     try:
-        return session.ref_selectors[ref]
+        target = session.ref_targets[ref]
     except KeyError as exc:
         raise RuntimeError(f"unknown ref {ref!r}; call browser_snapshot again") from exc
+    if target.page_id != page_id or target.top_url != page.url:
+        raise RuntimeError("snapshot ref belongs to a different page")
+    if target.frame_id != "main":
+        try:
+            if target.realm.is_detached():
+                raise RuntimeError("snapshot frame is detached")
+        except AttributeError:
+            pass
+        if getattr(target.realm, "url", "") != target.frame_url:
+            raise RuntimeError("snapshot frame navigated; call browser_snapshot again")
+    locator = target.realm.locator(target.selector)
+    count = await locator.count()
+    if count != 1:
+        raise RuntimeError(
+            f"snapshot ref is stale: selector now matches {count} elements"
+        )
+    identity = await locator.evaluate(_REF_IDENTITY_JS)
+    if not identity.get("visible"):
+        raise RuntimeError("snapshot ref is no longer visible")
+    if any(
+        str(identity.get(key) or "") != getattr(target, key)
+        for key in ("tag", "role", "name")
+    ):
+        raise RuntimeError("snapshot ref identity changed; call browser_snapshot again")
+    return locator
 
 
 def _alloc_pid(session: _Session) -> int:
@@ -2077,18 +2312,18 @@ async def _ref_action(
         sid = await _resolve_agent_session_id(session_id)
         async with _use_page(sid) as (s, page):
             try:
-                selector = _selector_for_ref(s, page, ref)
+                locator = await _locator_for_ref(s, page, ref)
                 if action == "click":
-                    await page.click(selector, timeout=timeout_ms)
+                    await locator.click(timeout=timeout_ms)
                     result = _ok(ref=ref, action=action)
                 elif action == "fill":
-                    await page.fill(selector, value, timeout=timeout_ms)
+                    await locator.fill(value, timeout=timeout_ms)
                     result = _ok(ref=ref, action=action, length=len(value), redacted=True)
                 elif action == "type":
-                    await page.type(selector, value, timeout=timeout_ms)
+                    await locator.type(value, timeout=timeout_ms)
                     result = _ok(ref=ref, action=action, length=len(value), redacted=True)
                 elif action == "select":
-                    selected = await page.select_option(selector, value, timeout=timeout_ms)
+                    selected = await locator.select_option(value, timeout=timeout_ms)
                     result = _ok(ref=ref, action=action, selected=list(selected))
                 else:
                     return _err(f"unknown ref action: {action}")
@@ -2176,13 +2411,16 @@ async def fill_form(
         async with _use_page(sid) as (s, page):
             filled = []
             try:
+                pending = []
                 for item in fields:
                     ref = str(item.get("ref", ""))
                     if not ref or "value" not in item:
                         return _err("each field requires ref and value")
-                    selector = _selector_for_ref(s, page, ref)
                     value = str(item["value"])
-                    await page.fill(selector, value, timeout=timeout_ms)
+                    locator = await _locator_for_ref(s, page, ref)
+                    pending.append((ref, value, locator))
+                for ref, value, locator in pending:
+                    await locator.fill(value, timeout=timeout_ms)
                     filled.append({"ref": ref, "length": len(value), "redacted": True})
                 result = _ok(filled=filled, count=len(filled))
                 if observe:

@@ -50,6 +50,12 @@ Ref mappings are stored in server memory. They do not add attributes or global
 variables to the page. Refresh the snapshot after navigation or when a ref is
 reported as stale.
 
+Snapshots recurse through same-origin and cross-origin Playwright frames,
+including nested frames. Frame refs use a prefix such as `f1:e512f730`, and the
+normal ref tools automatically execute in the correct frame. A frame whose
+realm cannot be inspected is still listed as `inaccessible` instead of being
+silently omitted.
+
 ### Interaction
 
 - `click_ref`

@@ -77,6 +77,8 @@ The default is `agent`.
 | `SPECTRA_MCP_MAX_EVALUATE_RESULT_BYTES` | `1048576` |
 | `SPECTRA_MCP_DEFAULT_PAGE_CHARS` | `8000` |
 | `SPECTRA_MCP_MAX_FORM_FIELDS` | `50` |
+| `SPECTRA_MCP_MAX_SNAPSHOT_FRAMES` | `32` |
+| `SPECTRA_MCP_MAX_FRAME_DEPTH` | `8` |
 
 Set `SPECTRA_MCP_DATA_ROOT` to restrict persistent profiles and storage-state
 input/output to one filesystem tree.

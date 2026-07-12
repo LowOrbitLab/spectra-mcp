@@ -727,7 +727,19 @@ class ContractTests(_AsyncToolTest):
         page = _Page()
         page.url = raw["url"]
         page.evaluate = AsyncMock(side_effect=[raw, raw])
-        page.fill = AsyncMock(return_value=None)
+        locator = SimpleNamespace(
+            count=AsyncMock(return_value=1),
+            evaluate=AsyncMock(
+                return_value={
+                    "tag": "",
+                    "role": "textbox",
+                    "name": "Password",
+                    "visible": True,
+                }
+            ),
+            fill=AsyncMock(return_value=None),
+        )
+        page.locator = lambda selector: locator
         await self.install_page("snapshot-ref", page)
 
         snapshot = await server.browser_snapshot(_Ctx(), "snapshot-ref")
@@ -739,7 +751,115 @@ class ContractTests(_AsyncToolTest):
         self.assertTrue(result["ok"])
         self.assertEqual(result["length"], 12)
         self.assertNotIn("super-secret", json.dumps(result))
-        page.fill.assert_awaited_once_with("#password", "super-secret", timeout=30000)
+        locator.fill.assert_awaited_once_with("super-secret", timeout=30000)
+
+    async def test_agent_snapshot_and_click_ref_include_child_frames(self):
+        top_raw = {
+            "title": "Checkout",
+            "url": "https://shop.test/",
+            "total_candidates": 0,
+            "items": [],
+        }
+        frame_raw = {
+            "title": "Payment",
+            "url": "https://pay.test/widget",
+            "total_candidates": 1,
+            "items": [
+                {
+                    "selector": "#pay",
+                    "tag": "button",
+                    "role": "button",
+                    "name": "Pay",
+                    "disabled": False,
+                    "checked": None,
+                    "selected": None,
+                    "value": None,
+                }
+            ],
+        }
+        locator = SimpleNamespace(
+            count=AsyncMock(return_value=1),
+            evaluate=AsyncMock(
+                return_value={
+                    "tag": "button",
+                    "role": "button",
+                    "name": "Pay",
+                    "visible": True,
+                }
+            ),
+            click=AsyncMock(return_value=None),
+        )
+        main_frame = SimpleNamespace(parent_frame=None)
+        child_frame = SimpleNamespace(
+            parent_frame=main_frame,
+            name="payment",
+            url=frame_raw["url"],
+            evaluate=AsyncMock(return_value=frame_raw),
+            locator=lambda selector: locator,
+            is_detached=lambda: False,
+        )
+        page = _Page()
+        page.url = top_raw["url"]
+        page.main_frame = main_frame
+        page.frames = [main_frame, child_frame]
+        page.evaluate = AsyncMock(return_value=top_raw)
+        await self.install_page("frame-ref", page)
+
+        snapshot = await server.browser_snapshot(_Ctx(), "frame-ref")
+        ref = snapshot["elements"][0]["ref"]
+        result = await server.click_ref(ref, _Ctx(), "frame-ref")
+
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(snapshot["frame_count"], 1)
+        self.assertTrue(ref.startswith("f1:"))
+        self.assertIn('iframe "payment" [frame=f1]', snapshot["snapshot"])
+        self.assertTrue(result["ok"])
+        locator.click.assert_awaited_once_with(timeout=30000)
+        page.evaluate.assert_any_await(server._SNAPSHOT_JS, 80)
+        child_frame.evaluate.assert_any_await(server._SNAPSHOT_JS, 40)
+
+    async def test_agent_snapshot_reports_inaccessible_frames(self):
+        top_raw = {
+            "title": "Protected",
+            "url": "https://example.test/",
+            "total_candidates": 0,
+            "items": [],
+            "child_frames": [
+                {
+                    "id": None,
+                    "name": None,
+                    "title": "Security challenge",
+                    "aria_label": None,
+                    "src": "https://challenge.test/",
+                    "visible": True,
+                    "rect": {"x": 10, "y": 20, "w": 300, "h": 80},
+                }
+            ],
+        }
+        main_frame = SimpleNamespace(parent_frame=None)
+        child_frame = SimpleNamespace(
+            parent_frame=main_frame,
+            name="",
+            url="",
+            evaluate=AsyncMock(side_effect=RuntimeError("permission denied")),
+        )
+        page = _Page()
+        page.url = top_raw["url"]
+        page.main_frame = main_frame
+        page.frames = [main_frame, child_frame]
+        page.evaluate = AsyncMock(return_value=top_raw)
+        await self.install_page("inaccessible-frame", page)
+
+        snapshot = await server.browser_snapshot(_Ctx(), "inaccessible-frame")
+
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(snapshot["frame_count"], 1)
+        self.assertFalse(snapshot["frames"][0]["accessible"])
+        self.assertIn("permission denied", snapshot["frames"][0]["error"])
+        self.assertIn(
+            'iframe "Security challenge" [frame=f1 inaccessible]',
+            snapshot["snapshot"],
+        )
 
     async def test_get_text_supports_pagination(self):
         page = _Page()
