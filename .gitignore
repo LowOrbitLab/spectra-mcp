@@ -1,7 +1,5 @@
 AGENTS.md
 CLAUDE.md
-docs/
-
 # Python
 __pycache__/
 *.egg-info/

@@ -853,13 +853,20 @@ class MetadataTests(unittest.TestCase):
             ["attached", "detached", "hidden", "visible"],
         )
 
-    def test_readme_mentions_every_tool_and_storage_state_parameter(self):
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    def test_documentation_mentions_every_tool_and_storage_state_parameter(self):
+        documentation = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+        )
         tools = asyncio.run(server.mcp.list_tools())
-        missing = [tool.name for tool in tools if f"`{tool.name}`" not in readme]
+        missing = [
+            tool.name
+            for tool in tools
+            if f"`{tool.name}`" not in documentation
+        ]
 
         self.assertEqual(missing, [])
-        self.assertIn("`storage_state_path`", readme)
+        self.assertIn("`storage_state_path`", documentation)
 
     def test_release_metadata_uses_loworbitlab_identity(self):
         document = tomllib.loads(

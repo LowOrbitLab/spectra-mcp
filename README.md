@@ -1,418 +1,87 @@
 # spectra_mcp
 
-An [MCP](https://modelcontextprotocol.io) server that exposes
-[`invisible_playwright`](https://github.com/feder-cr/invisible_playwright) — an
-anti-detect Firefox with patched fingerprint surfaces — to LLMs.
+An MCP server that gives AI agents a stateful anti-detect Firefox powered by
+[`invisible_playwright`](https://github.com/feder-cr/invisible_playwright).
 
-Your assistant can launch a fingerprint-randomized browser, navigate, click,
-type, read the DOM, and take screenshots through it, using the standard
-Playwright surface, but with a patched Firefox engine under the hood.
+Agents can navigate, inspect accessible page snapshots, interact through stable
+element refs, fill forms, read text, and capture screenshots without managing
+raw Playwright state.
 
-> The patched Firefox binary is a one-time ~100 MB download
-> (`python -m invisible_playwright fetch`, or the `fetch_binary` tool).
-
----
-
-## How it works
-
-- `invisible_playwright` is a **drop-in Playwright replacement** that patches
-  Firefox at the C++ level (navigator, GPU/WebGL, canvas, fonts, audio, WebRTC,
-  timezone, network) and humanizes mouse motion in the driver.
-- An MCP server is a **resident process**, which is exactly what a stateful
-  browser needs. This server keeps long-lived *sessions* in-process; each
-  session owns an `InvisiblePlaywright` instance plus one or more pages. Tools
-  operate on the session's **active page** unless told otherwise.
-
-```
-LLM ──MCP/stdio──► server ──► InvisiblePlaywright ──► patched Firefox
-                       ▲                (async API)
-              sessions held in-process
+```text
+AI agent ── MCP/stdio ──► spectra_mcp ──► patched Firefox
 ```
 
----
+## Highlights
+
+- Agent-first `snapshot → ref → action` workflow
+- Automatic fingerprint profile, timezone, and locale selection
+- Humanized mouse movement and browser-level fingerprint patches
+- Typed MCP results and real `isError=true` failures
+- Secret redaction and environment-based proxy credentials
+- Compact default tool profile for Hermes, OpenClaw, and other agents
 
 ## Install
 
+Requires Python 3.11+.
+
 ```bash
+git clone https://github.com/LowOrbitLab/spectra_mcp.git
+cd spectra_mcp
 pip install -e .
-python -m invisible_playwright fetch   # one-time ~100 MB, SHA256-verified
+python -m invisible_playwright fetch
 ```
 
-The patched browser dependency is pinned to an exact upstream Git commit so a
-clean install is reproducible. Installing directly from PyPI is not available
-until both projects have published releases.
+The patched Firefox download is approximately 100 MB and only needs to run
+once. The browser dependency is pinned to an exact upstream commit.
 
-Requires Python 3.11+. Supported platforms: Windows x86_64, Linux x86_64/arm64,
-macOS arm64/x86_64.
-
-> On macOS the app is ad-hoc signed (not notarized): if Gatekeeper complains,
-> clear the quarantine flag once with
-> `xattr -dr com.apple.quarantine` on the cached `Firefox.app`.
-
----
-
-## Configure your MCP client
-
-### opencode (`opencode.json`)
-
-```jsonc
-{
-  "mcp": {
-    "spectra_mcp": {
-      "type": "local",
-      "command": ["spectra_mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
-### Claude Desktop (`claude_desktop_config.json`)
+## MCP configuration
 
 ```json
 {
   "mcpServers": {
     "spectra_mcp": {
-      "command": "spectra_mcp"
+      "command": "/absolute/path/to/venv/bin/spectra_mcp",
+      "env": {
+        "SPECTRA_MCP_TOOL_PROFILE": "agent"
+      }
     }
   }
 }
 ```
 
-### Cursor (`~/.cursor/mcp.json`)
-
-```json
-{
-  "mcpServers": {
-    "spectra_mcp": {
-      "command": "spectra_mcp"
-    }
-  }
-}
-```
-
-If the console script isn't on `PATH`, use the module form instead:
-
-```json
-{ "command": "python", "args": ["-m", "spectra_mcp"] }
-```
-
-### Hermes Agent
-
-Use an absolute executable path because Hermes filters the subprocess
-environment. Browser calls within one session are serialized, so parallel tool
-calls must remain disabled.
-
-```yaml
-mcp_servers:
-  spectra_mcp:
-    command: /absolute/path/to/venv/bin/spectra_mcp
-    timeout: 300
-    connect_timeout: 30
-    supports_parallel_tool_calls: false
-    env:
-      SPECTRA_MCP_TOOL_PROFILE: agent
-      SPECTRA_MCP_DATA_ROOT: /absolute/path/to/spectra-data
-```
-
-Hermes currently consumes text tool content more reliably than MCP image-only
-content. Use `browser_snapshot` as the primary observation and treat
-`browser_screenshot` as an optional vision capability. MCP stderr is written under
-`~/.hermes/logs/mcp-stderr.log`.
-
-### OpenClaw
-
-Register the stdio command with an absolute path, select the `agent` profile,
-and run OpenClaw's MCP doctor/probe after configuration. Increase the embedded
-MCP idle TTL when browser sessions must survive more than about ten idle
-minutes. Keep `supportsParallelToolCalls` disabled for this stateful server.
-
-OpenClaw may cap tool results to roughly 16K characters on smaller contexts;
-`browser_get_text` therefore defaults to paginated 8K results and `browser_snapshot`
-is preferred over full HTML.
-
----
-
-## Quick start (for the LLM)
-
-1. **`fetch_binary`** (once) — download the patched Firefox if `binary_status`
-   says `ready: false`.
-2. **`browser_start`** → starts the single agent browser. Fingerprint profile,
-   timezone and locale are automatic by default.
-3. **`browser_navigate`**, then **`browser_snapshot`** to receive compact refs
-   such as `button "Sign in" [ref=e12ab34cd]`.
-4. Use **`click_ref`**, **`fill_ref`**, **`type_ref`**, **`select_ref`**, or
-   **`fill_form`**. Mutating ref actions return an updated snapshot by default.
-5. Use **`find_text`** or paginated **`browser_get_text`** for targeted reading.
-6. **`browser_stop`** when done. The server lifespan also cleans up Firefox.
-
-Log the `seed` to replay an identical fingerprint later (`start_session` with
-the same `seed`).
-
----
-
-## Tool reference
-
-Tool exposure is selected at server startup with `SPECTRA_MCP_TOOL_PROFILE`:
-
-| Profile | Tools | Approx. tool tokens | Intended use |
-|---------|------:|--------------------:|--------------|
-| `setup` | 2 | ~230 | Binary status/download only. |
-| `agent` | 18 | varies | Default. Safe, compact single-browser workflow for AI agents. |
-| `core` | 28 | varies | Legacy selector workflow plus tabs, HTML and `evaluate`. |
-| `full` | 71 | varies | Agent, core and every advanced storage/frame/input tool. |
-
-Token estimates use the `o200k_base` tokenizer and an OpenAI-style function-tool
-payload. Exact numbers vary by MCP client and whether output schemas are included.
-
-`agent` includes `browser_start`, `browser_status`, `browser_stop`,
-`browser_navigate`, `browser_reload`, `browser_snapshot`, `snapshot_find`,
-`click_ref`, `fill_ref`, `type_ref`, `select_ref`, `fill_form`, `find_text`,
-paginated `browser_get_text`, `browser_screenshot`, `browser_wait` and binary setup.
-
-`core` includes session lifecycle, page switching/popups, `goto`/`reload`,
-`click`/`fill`/`type_text`/`press_key`, scrolling/hover/selects, text/HTML/
-attribute/element reads, visibility, screenshots, waits and `evaluate`.
-
-```bash
-SPECTRA_MCP_TOOL_PROFILE=core spectra_mcp
-SPECTRA_MCP_TOOL_PROFILE=agent spectra_mcp
-SPECTRA_MCP_TOOL_PROFILE=full spectra_mcp
-```
-
-PowerShell equivalent:
-
-```powershell
-$env:SPECTRA_MCP_TOOL_PROFILE = "full"
-spectra_mcp
-```
-
-The server must be restarted after changing profiles. The reference below lists
-the complete `full` profile; disabled functions remain available internally for
-tests but are not advertised to the model.
-
-### Setup / binary
-| Tool | Description |
-|------|-------------|
-| `binary_status` | Is the patched Firefox cached? Does **not** download. |
-| `fetch_binary` | Download + SHA256-verify the binary (~100 MB, one-time). `force=True` to re-download. |
-
-### Session lifecycle
-| Tool | Description |
-|------|-------------|
-| `start_session` | Launch a browser with a fresh/seeded fingerprint. Returns `session_id`, `seed`, `page_id`. |
-| `close_session` | Close a session and free its Firefox process. |
-| `list_sessions` | Active session ids. |
-| `session_info` | Session metadata, pages, active page id, URL and title. |
-
-Agent lifecycle tools `browser_start`, `browser_status`, and `browser_stop`
-automatically use the only live session, so the model does not need to preserve
-a random session id through context compaction.
-
-### Pages
-| Tool | Description |
-|------|-------------|
-| `new_page` | Open a new tab; becomes the active page. |
-| `close_page` | Close a page (active by default). |
-| `switch_page` | Change the active page. |
-
-### Navigation
-`goto`, `go_forward`, `reload`
-
-`browser_navigate` and `browser_reload` are the single-session equivalents and
-include a fresh observation by default.
-
-### Interaction (humanized)
-`click`, `fill`, `type_text`, `press_key`, `keyboard_press`, `select_option`,
-`hover`, `focus`, `check`, `uncheck`, `scroll`
-
-### Reading
-`get_text`, `get_html`, `get_attribute`, `query_elements`, `is_visible`
-
-`browser_snapshot` produces an accessibility-oriented list of visible controls
-and headings with stable refs. `snapshot_find` searches those refs without raw
-HTML. Ref mappings live only in server memory and do not add attributes or
-globals to the page. `find_text` returns short surrounding snippets.
-
-`get_text`, `browser_get_text`, and `get_html` support `offset`, `next_offset`, `full_length`, and
-`truncated`; their default page size is 8,000 characters.
-
-`query_elements` returns a structured snapshot (tag, id, name, type, role, href,
-text, value, placeholder, visible, bounding rect) so the LLM can decide what to
-click without scraping raw HTML. Password input values are always redacted.
-
-### Ref interaction and forms
-
-`click_ref`, `fill_ref`, `type_ref`, `select_ref`, `fill_form`
-
-Refs come from `browser_snapshot`. A ref becomes invalid after switching pages
-or navigating without a new snapshot. Filled or typed values are never echoed
-into tool results; only their lengths are returned. `fill_form` accepts a list
-of `{ "ref": "...", "value": "..." }` objects.
-
-### Screenshot
-`screenshot` → returns image content directly to the LLM. Defaults to JPEG
-(`quality=85`) to keep payloads small; `image_format="png"` for lossless.
-`full_page=True` captures the whole scrollable page.
-
-`browser_screenshot` is the single-session Agent equivalent.
-
-### Waiting
-`wait_for_selector`, `wait_for_timeout`
-
-`browser_wait` is the single-session Agent equivalent of `wait_for_timeout`.
-
-`wait_for_selector` returns `reached=true` when the requested state is reached;
-`element_present` reports whether an element handle still exists (it is normally
-`false` after successful `hidden` / `detached` waits).
-
-### Advanced
-`evaluate` — run arbitrary JavaScript in the page and return its value. Powerful;
-use sparingly.
-
-### Coordinate mouse
-`mouse_drag`, `mouse_move`, `mouse_click`
-
-`mouse_drag` is intended for sliders, canvas handles and similar coordinate-based
-controls. With the current `firefox-15` patched binary, hold-drag requires a
-session started with `humanize=False`.
-
-### Focused keyboard
-`keyboard_down`, `keyboard_up`, `keyboard_type`
-
-Use `keyboard_down` / `keyboard_up` for modifier-key combinations. Always release
-keys that were explicitly held.
-
-### Dialogs and popups
-`set_dialog_handler`, `get_dialogs`, `wait_for_page`
-
-Dialogs are handled automatically according to the session policy so they cannot
-freeze an in-flight action. Popups are adopted into the session without changing
-the active page.
-
-### Cookies and storage state
-`get_cookies`, `add_cookies`, `clear_cookies`, `save_storage_state`
-
-Storage state contains cookies and localStorage. Treat saved files as secrets and
-resume them with `start_session(storage_state_path=...)`. Files are written via a
-private temporary file and atomically replaced; on Unix the final mode is `0600`.
-
-### Frames
-`list_frames`, `frame_click`, `frame_fill`, `frame_type`, `frame_get_text`,
-`frame_wait_for_selector`, `frame_query_elements`, `frame_evaluate`,
-`frame_get_html`, `frame_get_attribute`
-
-`list_frames` returns a unique selector for each top-level iframe. Chain selectors
-with `>>>` to address nested iframes.
-
----
-
-## `start_session` parameters
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `seed` | random | Reproducible fingerprint when set. |
-| `headless` | `true` | Windows/macOS self-cloak the window. |
-| `proxy_server` | `""` | `socks5://host:1080`, `http://...`, etc. DNS routes via proxy. |
-| `proxy_username` / `proxy_password` | `""` | Proxy auth. |
-| `timezone` | `""` | IANA zone; empty = auto from proxy/browser egress IP. |
-| `locale` | `"auto"` | `auto` = from egress country, or e.g. `en-US`. |
-| `humanize` | `true` | Bezier mouse paths + human timing. |
-| `profile_dir` | `""` | Persistent profile path (enables persistent context). |
-| `prep_recaptcha` | `false` | Pre-seed reCAPTCHA cookies (non-persistent only). |
-| `storage_state_path` | `""` | JSON file created by `save_storage_state`; cannot be combined with `profile_dir`. |
-| `fingerprint_profile` | `"auto"` | Linux non-persistent sessions use `linux_native`; other cases use upstream `windows`. |
-
-On Linux hosts, automatic `fingerprint_profile="linux_native"` avoids mixing a Windows
-navigator identity with Linux font and graphics behavior. It currently supports
-non-persistent sessions only. The renderer persona is selected deterministically
-from the session seed so a replayed seed keeps the same public GPU identity.
-This profile intentionally favors cross-surface consistency over fingerprint
-diversity: canvas, fonts, and most native Linux surfaces remain stable on one
-host, while the seed currently selects between a small validated renderer set.
-Use the upstream `windows` profile when broader per-seed variation matters more.
-
-Proxy credentials can be kept out of model tool-call history with
-`SPECTRA_MCP_PROXY_SERVER`, `SPECTRA_MCP_PROXY_USERNAME`, and
-`SPECTRA_MCP_PROXY_PASSWORD`. Explicit tool parameters override these defaults.
-Tool results and errors redact URL userinfo and authorization headers.
-
-Tool failures use MCP `isError=true` with a stable JSON message containing
-`code`, `message`, `retryable`, and `details`. Successful structured results use
-an unwrapped `{ "ok": true, ... }` envelope.
-
----
-
-## Runtime safeguards
-
-The resident server applies hard limits so a single tool call cannot exhaust the
-browser host or the stdio/MCP channel. Defaults can be changed with environment
-variables:
-
-- `SPECTRA_MCP_MAX_SESSIONS=8`
-- `SPECTRA_MCP_MAX_PAGES_PER_SESSION=32`
-- `SPECTRA_MCP_MAX_TEXT_CHARS=200000`
-- `SPECTRA_MCP_MAX_ELEMENT_RESULTS=500`
-- `SPECTRA_MCP_MAX_TIMEOUT_MS=300000`
-- `SPECTRA_MCP_MAX_DELAY_MS=10000`
-- `SPECTRA_MCP_MAX_CLICK_COUNT=10`
-- `SPECTRA_MCP_MAX_MOUSE_STEPS=1000`
-- `SPECTRA_MCP_MAX_SCREENSHOT_BYTES=10485760`
-- `SPECTRA_MCP_MAX_SCREENSHOT_PIXELS=50000000`
-- `SPECTRA_MCP_MAX_EVALUATE_RESULT_BYTES=1048576`
-- `SPECTRA_MCP_DEFAULT_PAGE_CHARS=8000`
-- `SPECTRA_MCP_MAX_FORM_FIELDS=50`
-
-Set `SPECTRA_MCP_DATA_ROOT` to restrict `profile_dir`, storage-state input, and
-storage-state output to one filesystem tree. When it is unset, arbitrary local
-paths remain available for trusted local MCP use.
-
-`timeout_ms=0` keeps Playwright's conventional “no timeout” meaning. Negative
-timeouts and positive values above the configured maximum are rejected.
-`fetch_binary(force=true)` is rejected while sessions are active or cleaning up;
-binary launch/download/cache mutation is serialized with a cross-process lock.
-
----
-
-## Notes & caveats
-
-- **IP matters.** The browser fingerprint is handled; ~90% of captchas that
-  remain are from known/blocked proxy IPs. Use clean residential IPs.
-- **First `start_session` needs network** to resolve geo/timezone (and to
-  download the binary if you skipped `fetch_binary`).
-- **Humanized clicks are slower** than vanilla Playwright — raise `timeout_ms`
-  if needed.
-- **Coordinate hold-drag requires `humanize=False`** on the current patched
-  Firefox build.
-- File chooser, browser download events, selector drag-and-drop and back
-  navigation are intentionally not exposed because `firefox-15` does not
-  support them reliably. Use `evaluate`-based workflows when appropriate.
-- **`evaluate` runs arbitrary JS** — only enable for trusted use.
-- All logging goes to **stderr** so it never corrupts the stdio JSON-RPC stream.
-- Calls against a single session must be sequential (the natural LLM pattern: the model waits for each tool result before sending the next). Concurrent calls to one session are not supported.
-
----
-
-## Development checks
-
-The regression suite uses only Python's standard library:
-
-```bash
-python -m unittest discover -s tests -v
-python -m compileall -q src tests
-```
-
-Real-browser integration checks are opt-in because they launch the patched
-Firefox and may require network access for session geo initialization:
-
-```bash
-SPECTRA_MCP_RUN_INTEGRATION=1 python -m unittest tests.test_integration -v
-```
-
----
+Use an absolute executable path when the client filters subprocess environment
+variables. Keep parallel tool calls disabled because operations within one
+browser session are serialized.
+
+Client-specific examples:
+
+- [Hermes Agent](docs/hermes.md)
+- [OpenClaw](docs/openclaw.md)
+- [Claude Desktop, Cursor, and OpenCode](docs/configuration.md)
+
+## Agent workflow
+
+1. Call `binary_status`; use `fetch_binary` if needed.
+2. Call `browser_start`.
+3. Navigate with `browser_navigate`.
+4. Inspect the page with `browser_snapshot`.
+5. Act through `click_ref`, `fill_ref`, `type_ref`, `select_ref`, or `fill_form`.
+6. Read targeted content with `find_text` or paginated `browser_get_text`.
+7. Call `browser_stop` when finished.
+
+Mutating ref actions return a refreshed snapshot by default. Agent tools
+automatically use the only live session, so models normally do not need to
+remember a session ID.
+
+## Documentation
+
+- [Tools and profiles](docs/tools.md)
+- [Configuration and environment variables](docs/configuration.md)
+- [Fingerprint profiles and geo behavior](docs/fingerprinting.md)
+- [Security and operational safeguards](docs/security.md)
+- [Development and testing](docs/development.md)
 
 ## License
 
-MIT. The patched Firefox binary is MPL-2.0 (Firefox upstream). This wrapper
-does not redistribute the binary; it downloads it on demand from the upstream
-releases.
+MIT. Firefox remains MPL-2.0. This project downloads the patched browser from
+upstream releases and does not redistribute it.
