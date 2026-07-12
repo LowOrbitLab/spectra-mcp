@@ -753,9 +753,9 @@ class MetadataTests(unittest.TestCase):
         )
         project = document["project"]
 
-        self.assertEqual(project["name"], "spectra-mcp")
+        self.assertEqual(project["name"], "spectra_mcp")
         self.assertEqual(
-            project["scripts"], {"spectra-mcp": "spectra_mcp.server:main"}
+            project["scripts"], {"spectra_mcp": "spectra_mcp.server:main"}
         )
         self.assertEqual(project["authors"], [{"name": "LowOrbitLab"}])
         self.assertTrue((ROOT / "LICENSE").is_file())

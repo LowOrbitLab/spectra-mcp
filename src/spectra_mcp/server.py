@@ -251,7 +251,7 @@ def _release_process_file_lock(handle: Any) -> None:
 @asynccontextmanager
 async def _binary_cache_guard():
     async with _BINARY_LOCK:
-        lock_path = Path(cache_root()) / ".spectra-mcp.lock"
+        lock_path = Path(cache_root()) / ".spectra_mcp.lock"
         acquire_task = asyncio.create_task(
             asyncio.to_thread(_acquire_process_file_lock, lock_path)
         )
@@ -682,7 +682,7 @@ async def _lifespan(app: FastMCP):
         await _close_all_sessions()
 
 
-mcp = FastMCP("spectra-mcp", lifespan=_lifespan)
+mcp = FastMCP("spectra_mcp", lifespan=_lifespan)
 
 _SETUP_TOOL_NAMES = {
     "binary_status",
@@ -2576,7 +2576,7 @@ async def frame_get_attribute(
 
 def main() -> None:
     """Run the MCP server over stdio."""
-    _log.info("starting spectra-mcp (stdio, tool_profile=%s)", _TOOL_PROFILE)
+    _log.info("starting spectra_mcp (stdio, tool_profile=%s)", _TOOL_PROFILE)
     mcp.run(transport="stdio")
 
 

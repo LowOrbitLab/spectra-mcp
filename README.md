@@ -1,4 +1,4 @@
-# Spectra MCP
+# spectra_mcp
 
 An [MCP](https://modelcontextprotocol.io) server that exposes
 [`invisible_playwright`](https://github.com/feder-cr/invisible_playwright) — an
@@ -34,7 +34,7 @@ LLM ──MCP/stdio──► server ──► InvisiblePlaywright ──► patc
 ## Install
 
 ```bash
-pip install -e .                       # or: pip install spectra-mcp
+pip install -e .                       # or: pip install spectra_mcp
 python -m invisible_playwright fetch   # one-time ~100 MB, SHA256-verified
 ```
 
@@ -54,9 +54,9 @@ macOS arm64/x86_64.
 ```jsonc
 {
   "mcp": {
-    "spectra-mcp": {
+    "spectra_mcp": {
       "type": "local",
-      "command": ["spectra-mcp"],
+      "command": ["spectra_mcp"],
       "enabled": true
     }
   }
@@ -68,8 +68,8 @@ macOS arm64/x86_64.
 ```json
 {
   "mcpServers": {
-    "spectra-mcp": {
-      "command": "spectra-mcp"
+    "spectra_mcp": {
+      "command": "spectra_mcp"
     }
   }
 }
@@ -80,8 +80,8 @@ macOS arm64/x86_64.
 ```json
 {
   "mcpServers": {
-    "spectra-mcp": {
-      "command": "spectra-mcp"
+    "spectra_mcp": {
+      "command": "spectra_mcp"
     }
   }
 }
@@ -130,15 +130,15 @@ payload. Exact numbers vary by MCP client and whether output schemas are include
 attribute/element reads, visibility, screenshots, waits and `evaluate`.
 
 ```bash
-SPECTRA_MCP_TOOL_PROFILE=core spectra-mcp
-SPECTRA_MCP_TOOL_PROFILE=full spectra-mcp
+SPECTRA_MCP_TOOL_PROFILE=core spectra_mcp
+SPECTRA_MCP_TOOL_PROFILE=full spectra_mcp
 ```
 
 PowerShell equivalent:
 
 ```powershell
 $env:SPECTRA_MCP_TOOL_PROFILE = "full"
-spectra-mcp
+spectra_mcp
 ```
 
 The server must be restarted after changing profiles. The reference below lists

@@ -1,1 +1,1 @@
-"""Spectra MCP 测试包。"""
+"""spectra_mcp test package."""
