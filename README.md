@@ -247,6 +247,16 @@ with `>>>` to address nested iframes.
 | `profile_dir` | `""` | Persistent profile path (enables persistent context). |
 | `prep_recaptcha` | `false` | Pre-seed reCAPTCHA cookies (non-persistent only). |
 | `storage_state_path` | `""` | JSON file created by `save_storage_state`; cannot be combined with `profile_dir`. |
+| `fingerprint_profile` | `"windows"` | `windows` keeps the upstream persona; `linux_native` uses a Linux-coherent identity and Mesa GPU surface on Linux. |
+
+On Linux hosts, `fingerprint_profile="linux_native"` avoids mixing a Windows
+navigator identity with Linux font and graphics behavior. It currently supports
+non-persistent sessions only. The renderer persona is selected deterministically
+from the session seed so a replayed seed keeps the same public GPU identity.
+This profile intentionally favors cross-surface consistency over fingerprint
+diversity: canvas, fonts, and most native Linux surfaces remain stable on one
+host, while the seed currently selects between a small validated renderer set.
+Use the upstream `windows` profile when broader per-seed variation matters more.
 
 ---
 

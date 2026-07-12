@@ -40,6 +40,8 @@ from invisible_playwright.download import (
     ensure_binary,
 )
 
+from spectra_mcp.linux_native import LinuxNativePlaywright
+
 # Logging MUST go to stderr: stdio transport reserves stdout for JSON-RPC.
 _log = logging.getLogger("spectra_mcp")
 if not _log.handlers:
@@ -872,6 +874,7 @@ async def start_session(
     profile_dir: str = "",
     prep_recaptcha: bool = False,
     storage_state_path: str = "",
+    fingerprint_profile: Literal["windows", "linux_native"] = "windows",
 ) -> Dict[str, Any]:
     """Start an anti-detect browser session with a fresh (or seeded) fingerprint.
 
@@ -915,6 +918,10 @@ async def start_session(
         cookies + localStorage at creation so a logged-in state resumes without
         re-authenticating. Non-persistent sessions only (cannot be combined with
         ``profile_dir``, whose on-disk profile already persists state).
+    fingerprint_profile : str
+        ``windows`` keeps invisible_playwright's cross-platform Windows persona.
+        ``linux_native`` uses a Linux-coherent identity and Mesa GPU surface;
+        it is supported on Linux for non-persistent sessions.
     """
     global _STARTING_SESSIONS
 
@@ -923,6 +930,15 @@ async def start_session(
             "storage_state_path cannot be combined with profile_dir: a "
             "persistent profile already persists cookies/localStorage"
         )
+    if fingerprint_profile not in {"windows", "linux_native"}:
+        return _err("fingerprint_profile must be 'windows' or 'linux_native'")
+    if fingerprint_profile == "linux_native":
+        if not sys.platform.startswith("linux"):
+            return _err("linux_native fingerprint profile requires Linux")
+        if profile_dir:
+            return _err("linux_native fingerprint profile does not support profile_dir")
+        if prep_recaptcha:
+            return _err("linux_native fingerprint profile does not support prep_recaptcha")
     try:
         if storage_state_path:
             storage_path = _resolve_data_path(storage_state_path, must_exist=True)
@@ -953,16 +969,26 @@ async def start_session(
     sid = secrets.token_hex(8)
     try:
         try:
-            ipw = InvisiblePlaywright(
-                seed=seed,
-                headless=headless,
-                proxy=proxy,
-                humanize=humanize,
-                locale=locale or "auto",
-                timezone=timezone or "",
-                profile_dir=profile_dir or None,
-                prep_recaptcha=prep_recaptcha,
-            )
+            if fingerprint_profile == "linux_native":
+                ipw = LinuxNativePlaywright(
+                    seed=seed,
+                    headless=headless,
+                    proxy=proxy,
+                    humanize=humanize,
+                    locale=locale or "auto",
+                    timezone=timezone or "",
+                )
+            else:
+                ipw = InvisiblePlaywright(
+                    seed=seed,
+                    headless=headless,
+                    proxy=proxy,
+                    humanize=humanize,
+                    locale=locale or "auto",
+                    timezone=timezone or "",
+                    profile_dir=profile_dir or None,
+                    prep_recaptcha=prep_recaptcha,
+                )
         except Exception as exc:
             return _err(f"launch setup failed: {exc}")
 
@@ -1019,6 +1045,7 @@ async def start_session(
         return _ok(
             session_id=sid,
             seed=ipw.seed,
+            fingerprint_profile=fingerprint_profile,
             persistent=persistent,
             page_id=pid,
             url=url,

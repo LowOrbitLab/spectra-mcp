@@ -241,6 +241,45 @@ class RuntimeRecoveryTests(_AsyncToolTest):
 
 
 class LifecycleHardeningTests(_AsyncToolTest):
+    async def test_linux_native_profile_uses_linux_launcher(self):
+        class FailConstructor:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+                raise ValueError("linux launcher selected")
+
+        with (
+            patch.object(server, "LinuxNativePlaywright", FailConstructor),
+            patch.object(server, "InvisiblePlaywright") as windows_constructor,
+        ):
+            result = await server.start_session(
+                _Ctx(),
+                seed=15,
+                fingerprint_profile="linux_native",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("linux launcher selected", result["error"])
+        windows_constructor.assert_not_called()
+
+    async def test_linux_native_profile_rejects_persistent_profile(self):
+        result = await server.start_session(
+            _Ctx(),
+            profile_dir="/tmp/profile",
+            fingerprint_profile="linux_native",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("does not support profile_dir", result["error"])
+
+    async def test_unknown_fingerprint_profile_is_rejected(self):
+        result = await server.start_session(
+            _Ctx(),
+            fingerprint_profile="unknown",  # type: ignore[arg-type]
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("fingerprint_profile must be", result["error"])
+
     async def test_start_session_cancellation_cleans_unpublished_browser(self):
         class Context:
             pages = []
