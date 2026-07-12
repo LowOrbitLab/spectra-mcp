@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from mcp.server.fastmcp.exceptions import ToolError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import spectra_mcp.server as server
@@ -241,6 +242,24 @@ class RuntimeRecoveryTests(_AsyncToolTest):
 
 
 class LifecycleHardeningTests(_AsyncToolTest):
+    async def test_auto_profile_selects_linux_native_on_linux(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("Linux-specific auto selection")
+
+        class FailConstructor:
+            def __init__(self, *args, **kwargs):
+                raise ValueError("auto selected linux")
+
+        with (
+            patch.object(server, "LinuxNativePlaywright", FailConstructor),
+            patch.object(server, "InvisiblePlaywright") as windows_constructor,
+        ):
+            result = await server.start_session(_Ctx())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("auto selected linux", result["error"])
+        windows_constructor.assert_not_called()
+
     async def test_linux_native_profile_uses_linux_launcher(self):
         class FailConstructor:
             def __init__(self, *args, **kwargs):
@@ -305,7 +324,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
             patch.object(server, "_binary_cache_guard", _noop_binary_guard),
         ):
             with self.assertRaises(asyncio.CancelledError):
-                await server.start_session(_Ctx())
+                await server.start_session(_Ctx(), fingerprint_profile="windows")
 
         self.assertTrue(ipw.exit_called)
         self.assertEqual(server._SESSIONS, {})
@@ -576,7 +595,9 @@ class ContractTests(_AsyncToolTest):
 
         with patch.object(server, "InvisiblePlaywright", FailConstructor):
             try:
-                result = await server.start_session(_Ctx())
+                result = await server.start_session(
+                    _Ctx(), fingerprint_profile="windows"
+                )
             except Exception as exc:
                 self.fail(f"start_session 泄漏异常：{exc}")
 
@@ -686,11 +707,90 @@ class ContractTests(_AsyncToolTest):
             server._QUERY_ELEMENTS_JS,
         )
 
+    async def test_agent_snapshot_refs_and_fill_results_are_redacted(self):
+        raw = {
+            "title": "Login",
+            "url": "https://example.test/login",
+            "total_candidates": 1,
+            "items": [
+                {
+                    "selector": "#password",
+                    "role": "textbox",
+                    "name": "Password",
+                    "disabled": False,
+                    "checked": None,
+                    "selected": None,
+                    "value": None,
+                }
+            ],
+        }
+        page = _Page()
+        page.url = raw["url"]
+        page.evaluate = AsyncMock(side_effect=[raw, raw])
+        page.fill = AsyncMock(return_value=None)
+        await self.install_page("snapshot-ref", page)
+
+        snapshot = await server.browser_snapshot(_Ctx(), "snapshot-ref")
+        ref = snapshot["elements"][0]["ref"]
+        result = await server.fill_ref(
+            ref, "super-secret", _Ctx(), "snapshot-ref"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["length"], 12)
+        self.assertNotIn("super-secret", json.dumps(result))
+        page.fill.assert_awaited_once_with("#password", "super-secret", timeout=30000)
+
+    async def test_get_text_supports_pagination(self):
+        page = _Page()
+        page.inner_text = AsyncMock(return_value="abcdefghij")
+        await self.install_page("paginate", page)
+
+        result = await server.get_text(
+            "paginate", _Ctx(), max_chars=4, offset=3
+        )
+
+        self.assertEqual(result["text"], "defg")
+        self.assertEqual(result["next_offset"], 7)
+        self.assertTrue(result["truncated"])
+
+    async def test_protocol_boundary_turns_error_dict_into_tool_error(self):
+        tool = server.mcp._tool_manager._tools["browser_status"]
+        with self.assertRaises(ToolError) as caught:
+            await tool.run({}, convert_result=True)
+
+        payload = str(caught.exception)
+        self.assertIn('"code":"SESSION_NOT_FOUND"', payload)
+        self.assertIn('"retryable":false', payload)
+
+    def test_protocol_output_schema_is_unwrapped_and_typed(self):
+        tool = server.mcp._tool_manager._tools["browser_status"]
+        schema = tool.output_schema
+
+        self.assertIn("session_id", schema["properties"])
+        self.assertNotIn("result", schema["properties"])
+
+    def test_agent_browser_tools_do_not_require_session_id(self):
+        tools = asyncio.run(server.mcp.list_tools())
+        for tool in tools:
+            if tool.name.startswith("browser_"):
+                self.assertNotIn("session_id", tool.inputSchema.get("required", []))
+
+    def test_error_sanitizer_redacts_url_credentials_and_auth_headers(self):
+        message = server._sanitize_message(
+            "proxy http://user:pass@example.test Authorization: Bearer-token"
+        )
+        self.assertNotIn("user:pass", message)
+        self.assertNotIn("Bearer-token", message)
+
+    def test_query_elements_redacts_password_values(self):
+        self.assertIn("!== 'password'", server._QUERY_ELEMENTS_JS)
+
 
 class MetadataTests(unittest.TestCase):
     def test_every_registered_tool_has_a_description(self):
         tools = asyncio.run(server.mcp.list_tools())
-        expected_counts = {"setup": 2, "core": 28, "full": 55}
+        expected_counts = {"setup": 2, "agent": 18, "core": 28, "full": 71}
         self.assertEqual(len(tools), expected_counts[server._TOOL_PROFILE])
         self.assertEqual(
             [tool.name for tool in tools if not (tool.description or "").strip()], []
@@ -701,7 +801,7 @@ class MetadataTests(unittest.TestCase):
             "import asyncio,json; import spectra_mcp.server as s; "
             "print(json.dumps([t.name for t in asyncio.run(s.mcp.list_tools())]))"
         )
-        expected_counts = {"setup": 2, "core": 28, "full": 55}
+        expected_counts = {"setup": 2, "agent": 18, "core": 28, "full": 71}
         for profile, expected_count in expected_counts.items():
             with self.subTest(profile=profile):
                 env = os.environ.copy()
@@ -723,19 +823,33 @@ class MetadataTests(unittest.TestCase):
                     self.assertIn("start_session", names)
                     self.assertIn("scroll", names)
                     self.assertNotIn("frame_click", names)
+                if profile == "agent":
+                    self.assertIn("browser_snapshot", names)
+                    self.assertIn("fill_form", names)
+                    self.assertNotIn("evaluate", names)
                 if profile == "full":
                     self.assertIn("frame_click", names)
                     self.assertIn("save_storage_state", names)
 
     def test_tool_schema_exposes_enum_constraints(self):
-        tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
-
+        script = (
+            "import asyncio,json; import spectra_mcp.server as s; "
+            "print(json.dumps({t.name:t.inputSchema for t in asyncio.run(s.mcp.list_tools())}))"
+        )
+        env = os.environ.copy()
+        env["SPECTRA_MCP_TOOL_PROFILE"] = "core"
+        env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+        tools = json.loads(
+            subprocess.check_output(
+                [sys.executable, "-c", script], cwd=ROOT, env=env, text=True
+            )
+        )
         self.assertEqual(
-            tools["click"].inputSchema["properties"]["button"]["enum"],
+            tools["click"]["properties"]["button"]["enum"],
             ["left", "middle", "right"],
         )
         self.assertEqual(
-            tools["wait_for_selector"].inputSchema["properties"]["state"]["enum"],
+            tools["wait_for_selector"]["properties"]["state"]["enum"],
             ["attached", "detached", "hidden", "visible"],
         )
 
@@ -760,7 +874,13 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(project["authors"], [{"name": "LowOrbitLab"}])
         self.assertTrue((ROOT / "LICENSE").is_file())
         self.assertNotIn("anyio>=4", project["dependencies"])
-        self.assertIn("invisible-playwright>=0.3.0,<0.4", project["dependencies"])
+        self.assertTrue(
+            any(
+                dependency.startswith("invisible-playwright @ git+")
+                and "@a1b75d93e928c37130833d667ae1acf15a23d027" in dependency
+                for dependency in project["dependencies"]
+            )
+        )
         self.assertIn("playwright>=1.40,<1.61", project["dependencies"])
         self.assertIn("mcp>=1.2,<2", project["dependencies"])
 

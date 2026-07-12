@@ -13,19 +13,23 @@ session.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import Context, FastMCP, Image
+from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import BaseModel, ConfigDict
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 # invisible_playwright ships an async façade that is a drop-in for the
@@ -81,6 +85,9 @@ class _Session:
     dialog_log: List[dict] = field(default_factory=list)  # capped, newest-last
     storage_state_path: Optional[str] = None  # seed cookies/localStorage at ctx creation
     _ctx_handlers_done: bool = False  # idempotency guard for context.on("dialog")
+    ref_page_id: Optional[int] = None
+    ref_url: str = ""
+    ref_selectors: Dict[str, str] = field(default_factory=dict)
 
 
 _SESSIONS: Dict[str, _Session] = {}
@@ -137,7 +144,160 @@ _MAX_SCREENSHOT_PIXELS = _env_positive_int(
 _MAX_EVALUATE_RESULT_BYTES = _env_positive_int(
     "SPECTRA_MCP_MAX_EVALUATE_RESULT_BYTES", 1024 * 1024
 )
+_DEFAULT_PAGE_CHARS = _env_positive_int("SPECTRA_MCP_DEFAULT_PAGE_CHARS", 8000)
+_MAX_FORM_FIELDS = _env_positive_int("SPECTRA_MCP_MAX_FORM_FIELDS", 50)
 _DATA_ROOT = os.environ.get("SPECTRA_MCP_DATA_ROOT", "").strip()
+
+
+class ToolResult(BaseModel):
+    """Stable success envelope used by structured MCP clients.
+
+    Individual tools may add fields; failures are raised at the MCP boundary and
+    become CallToolResult(isError=True) instead of successful ``ok=false`` data.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    ok: Literal[True] = True
+
+
+class BrowserStartResult(ToolResult):
+    session_id: str
+    seed: int
+    fingerprint_profile: str
+    requested_fingerprint_profile: str
+    timezone_mode: str
+    locale_mode: str
+    persistent: bool
+    page_id: int
+    url: str
+
+
+class BinaryStatusResult(ToolResult):
+    ready: bool
+    version: str
+    tool_profile: str
+    cache_dir: str
+    entry: Optional[str]
+    cache_root: str
+    broken_versions: List[str]
+
+
+class FetchBinaryResult(ToolResult):
+    path: str
+    version: str
+    cache_root: str
+
+
+class BrowserStatusResult(ToolResult):
+    session_id: str
+    seed: int
+    persistent: bool
+    active_page_id: Optional[int]
+    active_url: Optional[str]
+    active_title: Optional[str]
+    pages: List[Dict[str, Any]]
+
+
+class NavigationResult(ToolResult):
+    url: str
+    status: Optional[int] = None
+    title: Optional[str] = None
+    observation: Optional[Dict[str, Any]] = None
+
+
+class SnapshotResult(ToolResult):
+    session_id: str
+    page_id: int
+    url: str
+    title: str
+    count: int
+    truncated: bool
+    snapshot: str
+    elements: List[Dict[str, Any]]
+
+
+class ActionResult(ToolResult):
+    ref: str
+    action: str
+    observation: Optional[Dict[str, Any]] = None
+
+
+class FillFormResult(ToolResult):
+    count: int
+    filled: List[Dict[str, Any]]
+    observation: Optional[Dict[str, Any]] = None
+
+
+class SessionClosedResult(ToolResult):
+    session_id: str
+
+
+class WaitResult(ToolResult):
+    ms: int
+
+
+class TextPageResult(ToolResult):
+    truncated: bool
+    full_length: int
+    offset: int
+    next_offset: Optional[int]
+    text: str
+
+
+class SearchResult(ToolResult):
+    query: str
+    count: int
+    matches: List[Dict[str, Any]]
+
+
+_TOOL_RESULT_MODELS: Dict[str, type[ToolResult]] = {
+    "binary_status": BinaryStatusResult,
+    "fetch_binary": FetchBinaryResult,
+    "start_session": BrowserStartResult,
+    "browser_start": BrowserStartResult,
+    "close_session": SessionClosedResult,
+    "browser_stop": SessionClosedResult,
+    "session_info": BrowserStatusResult,
+    "browser_status": BrowserStatusResult,
+    "goto": NavigationResult,
+    "browser_navigate": NavigationResult,
+    "reload": NavigationResult,
+    "browser_reload": NavigationResult,
+    "browser_snapshot": SnapshotResult,
+    "click_ref": ActionResult,
+    "fill_ref": ActionResult,
+    "type_ref": ActionResult,
+    "select_ref": ActionResult,
+    "fill_form": FillFormResult,
+    "get_text": TextPageResult,
+    "browser_get_text": TextPageResult,
+    "find_text": SearchResult,
+    "snapshot_find": SearchResult,
+    "wait_for_timeout": WaitResult,
+    "browser_wait": WaitResult,
+}
+
+
+_SECRET_URL_RE = re.compile(r"(?P<scheme>https?://)(?P<userinfo>[^/@\s]+)@", re.I)
+_AUTH_RE = re.compile(
+    r"(?i)(authorization|proxy-authorization)(\s*[:=]\s*)([^\s,;]+)"
+)
+
+
+def _sanitize_message(value: Any) -> str:
+    text = str(value)
+    text = _SECRET_URL_RE.sub(lambda m: f"{m.group('scheme')}***:***@", text)
+    return _AUTH_RE.sub(r"\1\2***", text)
+
+
+def _sanitize_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_message(value)
+    if isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_value(item) for key, item in value.items()}
+    return value
 
 
 def _ok(**kw: Any) -> Dict[str, Any]:
@@ -147,8 +307,27 @@ def _ok(**kw: Any) -> Dict[str, Any]:
 
 def _err(msg: str, **kw: Any) -> Dict[str, Any]:
     kw["ok"] = False
-    kw["error"] = msg
+    kw["error"] = _sanitize_message(msg)
+    kw.setdefault("code", "TOOL_ERROR")
+    kw.setdefault("retryable", False)
     return kw
+
+
+def _raise_protocol_error(result: Dict[str, Any]) -> None:
+    payload = {
+        "ok": False,
+        "error": {
+            "code": result.get("code", "TOOL_ERROR"),
+            "message": _sanitize_message(result.get("error", "tool failed")),
+            "retryable": bool(result.get("retryable", False)),
+            "details": {
+                key: _sanitize_value(value)
+                for key, value in result.items()
+                if key not in {"ok", "error", "code", "retryable"}
+            },
+        },
+    }
+    raise ToolError(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def _range_error(name: str, value: int, minimum: int, maximum: int) -> Optional[str]:
@@ -283,6 +462,23 @@ async def _get_session(session_id: str) -> _Session:
     return s
 
 
+async def _resolve_agent_session_id(session_id: str = "") -> str:
+    if session_id:
+        await _get_session(session_id)
+        return session_id
+    async with _LOCK:
+        live = [
+            sid
+            for sid, session in _SESSIONS.items()
+            if session.ready and not session.closed
+        ]
+    if len(live) == 1:
+        return live[0]
+    if not live:
+        raise KeyError("no active browser session; call browser_start")
+    raise KeyError("multiple browser sessions are active; provide session_id")
+
+
 def _active_page(session: _Session) -> Any:
     if session.active_page_id is None:
         raise RuntimeError("session has no active page; call new_page first")
@@ -313,7 +509,8 @@ _QUERY_ELEMENTS_JS = """
       type: e.getAttribute('type'),
       role: e.getAttribute('role'),
       href: e.tagName === 'A' ? (e.href || null) : null,
-      value: ('value' in e) ? e.value : null,
+      value: ('value' in e && (e.getAttribute('type') || '').toLowerCase() !== 'password')
+        ? e.value : null,
       placeholder: e.getAttribute('placeholder'),
       text: (e.innerText || '').slice(0, 200),
       visible: style.visibility === 'visible' && !!(r.width || r.height),
@@ -322,6 +519,131 @@ _QUERY_ELEMENTS_JS = """
   });
 }
 """
+
+_SNAPSHOT_JS = r"""
+(limit) => {
+  const candidates = Array.from(document.querySelectorAll(
+    'a,button,input,textarea,select,summary,[role],[contenteditable="true"],h1,h2,h3'
+  ));
+  const cssPath = (el) => {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.documentElement) {
+      let part = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(x => x.tagName === node.tagName);
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+    return parts.join(' > ');
+  };
+  const roleOf = (el) => el.getAttribute('role') || ({
+    A: 'link', BUTTON: 'button', INPUT: (el.type === 'checkbox' ? 'checkbox' :
+      el.type === 'radio' ? 'radio' : el.type === 'submit' ? 'button' : 'textbox'),
+    TEXTAREA: 'textbox', SELECT: 'combobox', SUMMARY: 'button',
+    H1: 'heading', H2: 'heading', H3: 'heading'
+  }[el.tagName] || el.tagName.toLowerCase());
+  const nameOf = (el) => {
+    const labelled = el.getAttribute('aria-label');
+    if (labelled) return labelled;
+    const by = el.getAttribute('aria-labelledby');
+    if (by) {
+      const text = by.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' ').trim();
+      if (text) return text;
+    }
+    if (el.labels?.length) return Array.from(el.labels).map(x => x.innerText || '').join(' ').trim();
+    return (el.innerText || el.getAttribute('placeholder') || el.getAttribute('title') ||
+      el.getAttribute('name') || '').trim();
+  };
+  const out = [];
+  for (const el of candidates) {
+    if (out.length >= limit) break;
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || (!r.width && !r.height)) continue;
+    const role = roleOf(el);
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const item = {
+      selector: cssPath(el), role, name: nameOf(el).replace(/\s+/g, ' ').slice(0, 160),
+      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      checked: ('checked' in el) ? !!el.checked : null,
+      selected: ('selected' in el) ? !!el.selected : null,
+      value: ('value' in el && type !== 'password') ? String(el.value).slice(0, 120) : null
+    };
+    out.push(item);
+  }
+  return {title: document.title, url: location.href, items: out, total_candidates: candidates.length};
+}
+"""
+
+
+def _snapshot_ref(page_id: int, selector: str) -> str:
+    digest = hashlib.sha1(f"{page_id}:{selector}".encode()).hexdigest()[:8]
+    return f"e{digest}"
+
+
+async def _snapshot_page(
+    session: _Session, page: Any, max_elements: int = 120
+) -> Dict[str, Any]:
+    if error := _range_error("max_elements", max_elements, 1, _MAX_ELEMENT_RESULTS):
+        return _err(error)
+    raw = await page.evaluate(_SNAPSHOT_JS, max_elements)
+    page_id = _tracked_page_id(session, page)
+    if page_id is None:
+        return _err("active page is not tracked")
+    refs: Dict[str, str] = {}
+    elements = []
+    lines = []
+    for item in raw.get("items", []):
+        selector = item["selector"]
+        ref = _snapshot_ref(page_id, selector)
+        suffix = 2
+        base_ref = ref
+        while ref in refs and refs[ref] != selector:
+            ref = f"{base_ref}_{suffix}"
+            suffix += 1
+        refs[ref] = selector
+        element = {"ref": ref, **{key: value for key, value in item.items() if key != "selector"}}
+        elements.append(element)
+        state = []
+        for key in ("disabled", "checked", "selected"):
+            if element.get(key) not in (None, False):
+                state.append(key)
+        value = element.get("value")
+        value_part = f' value="{value}"' if value else ""
+        state_part = f" [{' '.join(state)}]" if state else ""
+        lines.append(
+            f'- {element["role"]} "{element["name"]}" [ref={ref}]'
+            f"{value_part}{state_part}"
+        )
+    session.ref_page_id = page_id
+    session.ref_url = raw.get("url", page.url)
+    session.ref_selectors = refs
+    truncated = raw.get("total_candidates", len(elements)) > len(elements)
+    return _ok(
+        session_id=session.session_id,
+        page_id=page_id,
+        url=raw.get("url", page.url),
+        title=raw.get("title", ""),
+        count=len(elements),
+        truncated=truncated,
+        snapshot="\n".join(lines),
+        elements=elements,
+    )
+
+
+def _selector_for_ref(session: _Session, page: Any, ref: str) -> str:
+    page_id = _tracked_page_id(session, page)
+    if session.ref_page_id != page_id or session.ref_url != page.url:
+        raise RuntimeError("snapshot is stale; call browser_snapshot again")
+    try:
+        return session.ref_selectors[ref]
+    except KeyError as exc:
+        raise RuntimeError(f"unknown ref {ref!r}; call browser_snapshot again") from exc
 
 
 def _alloc_pid(session: _Session) -> int:
@@ -689,6 +1011,25 @@ _SETUP_TOOL_NAMES = {
     "fetch_binary",
 }
 
+_AGENT_TOOL_NAMES = _SETUP_TOOL_NAMES | {
+    "browser_start",
+    "browser_status",
+    "browser_stop",
+    "browser_navigate",
+    "browser_reload",
+    "browser_snapshot",
+    "snapshot_find",
+    "click_ref",
+    "fill_ref",
+    "type_ref",
+    "select_ref",
+    "fill_form",
+    "find_text",
+    "browser_get_text",
+    "browser_screenshot",
+    "browser_wait",
+}
+
 _CORE_TOOL_NAMES = _SETUP_TOOL_NAMES | {
     "start_session",
     "close_session",
@@ -721,14 +1062,14 @@ _CORE_TOOL_NAMES = _SETUP_TOOL_NAMES | {
 
 def _normalize_tool_profile(value: str) -> str:
     profile = (value or "core").strip().lower()
-    if profile not in {"setup", "core", "full"}:
-        _log.warning("unknown tool profile %r; using core", value)
-        return "core"
+    if profile not in {"setup", "agent", "core", "full"}:
+        _log.warning("unknown tool profile %r; using agent", value)
+        return "agent"
     return profile
 
 
 _TOOL_PROFILE = _normalize_tool_profile(
-    os.environ.get("SPECTRA_MCP_TOOL_PROFILE", "core")
+    os.environ.get("SPECTRA_MCP_TOOL_PROFILE", "agent")
 )
 
 
@@ -738,6 +1079,8 @@ def _tool_enabled(name: str, profile: Optional[str] = None) -> bool:
         return True
     if selected == "setup":
         return name in _SETUP_TOOL_NAMES
+    if selected == "agent":
+        return name in _AGENT_TOOL_NAMES
     return name in _CORE_TOOL_NAMES
 
 
@@ -748,7 +1091,25 @@ def _profiled_tool(*args: Any, **kwargs: Any):
     def _decorate(func: Any) -> Any:
         if not _tool_enabled(func.__name__):
             return func
-        return _register_mcp_tool(*args, **kwargs)(func)
+
+        @wraps(func)
+        async def _protocol_checked(*fn_args: Any, **fn_kwargs: Any) -> Any:
+            try:
+                result = await func(*fn_args, **fn_kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ToolError(_sanitize_message(exc)) from exc
+            if isinstance(result, dict) and result.get("ok") is False:
+                _raise_protocol_error(result)
+            return result
+
+        if func.__annotations__.get("return") in {"Dict[str, Any]", Dict[str, Any]}:
+            _protocol_checked.__annotations__["return"] = _TOOL_RESULT_MODELS.get(
+                func.__name__, ToolResult
+            )
+        _register_mcp_tool(*args, **kwargs)(_protocol_checked)
+        return func
 
     return _decorate
 
@@ -874,56 +1235,27 @@ async def start_session(
     profile_dir: str = "",
     prep_recaptcha: bool = False,
     storage_state_path: str = "",
-    fingerprint_profile: Literal["windows", "linux_native"] = "windows",
+    fingerprint_profile: Literal["auto", "windows", "linux_native"] = "auto",
 ) -> Dict[str, Any]:
-    """Start an anti-detect browser session with a fresh (or seeded) fingerprint.
+    """Start a browser session and return its id, seed, page and effective profile.
 
-    Returns ``session_id``, ``seed`` (log it to replay), and the initial
-    ``page_id``. Every Playwright method on the resulting browser works as-is.
-
-    Parameters
-    ----------
-    seed : int, optional
-        Reproducible fingerprint. Random per session when omitted. NOTE: the
-        render-noise seed pool is calibrated on one GPU family and is NOT
-        host-independent, so a random seed has a meaningful chance (~40% on a
-        QEMU virtual GPU vs. Fingerprint Pro) of producing a "dirty" canvas/WebGL
-        hash that strict detectors flag as tampering. For best results pass an
-        explicit seed you have pre-validated on the deployment host (screen a
-        small range, e.g. 1-50, against your target detector and keep the ones
-        with low tampering_ml / anti_detect=false). Which seeds are clean
-        depends on the host GPU — do not assume a seed good on one machine is
-        good on another. On the tested host (Linux + QEMU virtual GPU) seeds
-        12, 15, 21, 25 scored lowest; the returned ``seed`` is logged for
-        replay, so record a good one and reuse it.
-    headless : bool
-        On Windows/macOS the patched binary self-cloaks its window.
-    proxy_server : str
-        e.g. ``socks5://host:1080`` (socks5/socks4/http/https). DNS routes
-        through the proxy by default.
-    proxy_username, proxy_password : str
-        Proxy credentials, used only when ``proxy_server`` is set.
-    timezone : str
-        IANA zone (e.g. ``America/New_York``). Empty = auto-derive from egress IP.
-    locale : str
-        ``auto`` derives language from egress country, or an explicit locale.
-    humanize : bool
-        Bezier-curve mouse motion + human timing on clicks/hover/drag.
-    profile_dir : str
-        Optional persistent profile path (enables a persistent context).
-    prep_recaptcha : bool
-        Pre-seed reCAPTCHA cookies (only when not using a persistent profile).
-    storage_state_path : str
-        Path to a JSON file saved by ``save_storage_state`` — seeds the context's
-        cookies + localStorage at creation so a logged-in state resumes without
-        re-authenticating. Non-persistent sessions only (cannot be combined with
-        ``profile_dir``, whose on-disk profile already persists state).
-    fingerprint_profile : str
-        ``windows`` keeps invisible_playwright's cross-platform Windows persona.
-        ``linux_native`` uses a Linux-coherent identity and Mesa GPU surface;
-        it is supported on Linux for non-persistent sessions.
+    ``fingerprint_profile=auto`` selects a host-coherent profile. Empty timezone
+    and ``locale=auto`` are derived from the proxy/browser egress IP. Explicit
+    values remain available for reproducible testing.
     """
     global _STARTING_SESSIONS
+
+    proxy_server = proxy_server or os.environ.get("SPECTRA_MCP_PROXY_SERVER", "")
+    proxy_username = proxy_username or os.environ.get("SPECTRA_MCP_PROXY_USERNAME", "")
+    proxy_password = proxy_password or os.environ.get("SPECTRA_MCP_PROXY_PASSWORD", "")
+
+    requested_fingerprint_profile = fingerprint_profile
+    if fingerprint_profile == "auto":
+        fingerprint_profile = (
+            "linux_native"
+            if sys.platform.startswith("linux") and not profile_dir and not prep_recaptcha
+            else "windows"
+        )
 
     if storage_state_path and profile_dir:
         return _err(
@@ -931,7 +1263,7 @@ async def start_session(
             "persistent profile already persists cookies/localStorage"
         )
     if fingerprint_profile not in {"windows", "linux_native"}:
-        return _err("fingerprint_profile must be 'windows' or 'linux_native'")
+        return _err("fingerprint_profile must be 'auto', 'windows', or 'linux_native'")
     if fingerprint_profile == "linux_native":
         if not sys.platform.startswith("linux"):
             return _err("linux_native fingerprint profile requires Linux")
@@ -1046,6 +1378,9 @@ async def start_session(
             session_id=sid,
             seed=ipw.seed,
             fingerprint_profile=fingerprint_profile,
+            requested_fingerprint_profile=requested_fingerprint_profile,
+            timezone_mode="auto" if not timezone else "explicit",
+            locale_mode="auto" if (locale or "auto").lower() == "auto" else "explicit",
             persistent=persistent,
             page_id=pid,
             url=url,
@@ -1138,6 +1473,64 @@ async def session_info(session_id: str, ctx: Context) -> Dict[str, Any]:
             active_title=active_title,
             pages=pages_info,
         )
+
+
+@mcp.tool()
+async def browser_start(
+    ctx: Context,
+    seed: Optional[int] = None,
+    headless: bool = True,
+    proxy_server: str = "",
+    proxy_username: str = "",
+    proxy_password: str = "",
+    timezone: str = "",
+    locale: str = "auto",
+    humanize: bool = True,
+    fingerprint_profile: Literal["auto", "windows", "linux_native"] = "auto",
+) -> Dict[str, Any]:
+    """Start the single browser used by agent tools; geo settings default to auto."""
+    try:
+        existing = await _resolve_agent_session_id()
+    except KeyError as exc:
+        if "no active browser session" not in str(exc):
+            return _err(str(exc))
+    else:
+        return _err(
+            f"browser session {existing!r} is already active",
+            code="SESSION_ALREADY_ACTIVE",
+        )
+    return await start_session(
+        ctx,
+        seed=seed,
+        headless=headless,
+        proxy_server=proxy_server,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+        timezone=timezone,
+        locale=locale,
+        humanize=humanize,
+        fingerprint_profile=fingerprint_profile,
+    )
+
+
+@mcp.tool()
+async def browser_status(ctx: Context, session_id: str = "") -> Dict[str, Any]:
+    """Return status for the single agent browser; session_id is usually omitted."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+    return await session_info(sid, ctx)
+
+
+@mcp.tool()
+async def browser_stop(ctx: Context, session_id: str = "") -> Dict[str, Any]:
+    """Close the single agent browser; session_id is usually omitted."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+    return await close_session(sid, ctx)
 
 
 # --------------------------------------------------------------------------- #
@@ -1251,8 +1644,14 @@ def _pw_err(s: _Session, what: str, exc: Exception) -> Dict[str, Any]:
     session was closed (e.g. force-closed by ``_close_session`` mid-call);
     otherwise the raw Playwright error message."""
     if s.closed:
-        return _err("session closed")
-    return _err(f"{what} failed: {exc}")
+        return _err("session closed", code="SESSION_CLOSED")
+    if isinstance(exc, (PlaywrightTimeoutError, asyncio.TimeoutError)):
+        return _err(
+            f"{what} timed out: {exc}",
+            code="PLAYWRIGHT_TIMEOUT",
+            retryable=True,
+        )
+    return _err(f"{what} failed: {exc}", code="PLAYWRIGHT_ERROR")
 
 
 @mcp.tool()
@@ -1330,6 +1729,50 @@ async def reload(
         return _err(str(exc))
 
 
+@mcp.tool()
+async def browser_navigate(
+    url: str,
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = "load",
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Navigate the single agent browser and optionally return a compact snapshot."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+    result = await goto(sid, url, ctx, timeout_ms=timeout_ms, wait_until=wait_until)
+    if not result.get("ok") or not observe:
+        return result
+    snapshot = await browser_snapshot(ctx, sid)
+    if snapshot.get("ok"):
+        result["observation"] = snapshot
+    return result
+
+
+@mcp.tool()
+async def browser_reload(
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Reload the single agent browser and optionally return a compact snapshot."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+    result = await reload(sid, ctx, timeout_ms=timeout_ms)
+    if not result.get("ok") or not observe:
+        return result
+    snapshot = await browser_snapshot(ctx, sid)
+    if snapshot.get("ok"):
+        result["observation"] = snapshot
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Interaction
 # --------------------------------------------------------------------------- #
@@ -1377,7 +1820,7 @@ async def fill(
                 await page.fill(selector, value, timeout=timeout_ms)
             except Exception as exc:
                 return _pw_err(s, "fill", exc)
-            return _ok(selector=selector, value=value)
+            return _ok(selector=selector, length=len(value), redacted=True)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1565,15 +2008,205 @@ async def scroll(
 
 
 @mcp.tool()
+async def browser_snapshot(
+    ctx: Context,
+    session_id: str = "",
+    max_elements: int = 120,
+) -> Dict[str, Any]:
+    """Return a compact accessibility-oriented page snapshot with stable refs."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+        async with _use_page(sid) as (s, page):
+            try:
+                return await _snapshot_page(s, page, max_elements)
+            except Exception as exc:
+                return _pw_err(s, "browser_snapshot", exc)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+
+
+@mcp.tool()
+async def snapshot_find(
+    query: str,
+    ctx: Context,
+    session_id: str = "",
+    role: str = "",
+    max_results: int = 20,
+) -> Dict[str, Any]:
+    """Refresh the snapshot and return refs matching accessible name/value/role."""
+    if error := _range_error("max_results", max_results, 1, _MAX_ELEMENT_RESULTS):
+        return _err(error)
+    snapshot = await browser_snapshot(ctx, session_id)
+    if not snapshot.get("ok"):
+        return snapshot
+    needle = query.casefold().strip()
+    wanted_role = role.casefold().strip()
+    matches = []
+    for element in snapshot["elements"]:
+        haystack = " ".join(
+            str(element.get(key) or "") for key in ("name", "value", "role")
+        ).casefold()
+        if needle in haystack and (
+            not wanted_role or str(element.get("role", "")).casefold() == wanted_role
+        ):
+            matches.append(element)
+            if len(matches) >= max_results:
+                break
+    return _ok(
+        session_id=snapshot["session_id"],
+        page_id=snapshot["page_id"],
+        query=query,
+        role=role or None,
+        count=len(matches),
+        matches=matches,
+    )
+
+
+async def _ref_action(
+    action: str,
+    ref: str,
+    ctx: Context,
+    session_id: str,
+    value: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+        async with _use_page(sid) as (s, page):
+            try:
+                selector = _selector_for_ref(s, page, ref)
+                if action == "click":
+                    await page.click(selector, timeout=timeout_ms)
+                    result = _ok(ref=ref, action=action)
+                elif action == "fill":
+                    await page.fill(selector, value, timeout=timeout_ms)
+                    result = _ok(ref=ref, action=action, length=len(value), redacted=True)
+                elif action == "type":
+                    await page.type(selector, value, timeout=timeout_ms)
+                    result = _ok(ref=ref, action=action, length=len(value), redacted=True)
+                elif action == "select":
+                    selected = await page.select_option(selector, value, timeout=timeout_ms)
+                    result = _ok(ref=ref, action=action, selected=list(selected))
+                else:
+                    return _err(f"unknown ref action: {action}")
+                if observe:
+                    result["observation"] = await _snapshot_page(s, page)
+                return result
+            except Exception as exc:
+                return _pw_err(s, action, exc)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+
+
+@mcp.tool()
+async def click_ref(
+    ref: str,
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Click a ref from browser_snapshot and return the updated snapshot."""
+    return await _ref_action("click", ref, ctx, session_id, timeout_ms=timeout_ms, observe=observe)
+
+
+@mcp.tool()
+async def fill_ref(
+    ref: str,
+    value: str,
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Fill a snapshot ref without echoing the value into the tool result."""
+    return await _ref_action(
+        "fill", ref, ctx, session_id, value, timeout_ms, observe
+    )
+
+
+@mcp.tool()
+async def type_ref(
+    ref: str,
+    text: str,
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Type into a snapshot ref without echoing the text into the result."""
+    return await _ref_action(
+        "type", ref, ctx, session_id, text, timeout_ms, observe
+    )
+
+
+@mcp.tool()
+async def select_ref(
+    ref: str,
+    value: str,
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Select an option by snapshot ref and return the updated snapshot."""
+    return await _ref_action(
+        "select", ref, ctx, session_id, value, timeout_ms, observe
+    )
+
+
+@mcp.tool()
+async def fill_form(
+    fields: List[Dict[str, str]],
+    ctx: Context,
+    session_id: str = "",
+    timeout_ms: int = 30000,
+    observe: bool = True,
+) -> Dict[str, Any]:
+    """Fill several snapshot refs in one call; each item has ref and value."""
+    if not 1 <= len(fields) <= _MAX_FORM_FIELDS:
+        return _err(f"fields must contain between 1 and {_MAX_FORM_FIELDS} items")
+    if error := _timeout_error(timeout_ms):
+        return _err(error)
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+        async with _use_page(sid) as (s, page):
+            filled = []
+            try:
+                for item in fields:
+                    ref = str(item.get("ref", ""))
+                    if not ref or "value" not in item:
+                        return _err("each field requires ref and value")
+                    selector = _selector_for_ref(s, page, ref)
+                    value = str(item["value"])
+                    await page.fill(selector, value, timeout=timeout_ms)
+                    filled.append({"ref": ref, "length": len(value), "redacted": True})
+                result = _ok(filled=filled, count=len(filled))
+                if observe:
+                    result["observation"] = await _snapshot_page(s, page)
+                return result
+            except Exception as exc:
+                return _pw_err(s, "fill_form", exc)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+
+
+@mcp.tool()
 async def get_text(
     session_id: str,
     ctx: Context,
     selector: str = "",
-    max_chars: int = 20000,
+    max_chars: int = _DEFAULT_PAGE_CHARS,
+    offset: int = 0,
 ) -> Dict[str, Any]:
-    """Get visible text. Empty ``selector`` = the whole body. Output is capped to ``max_chars``."""
+    """Get a page of visible text; use offset to continue without large results."""
     if error := _range_error("max_chars", max_chars, 0, _MAX_TEXT_CHARS):
         return _err(error)
+    if offset < 0:
+        return _err("offset must be non-negative")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1586,10 +2219,78 @@ async def get_text(
                     text = await page.inner_text("body")
             except Exception as exc:
                 return _pw_err(s, "get_text", exc)
-            truncated = len(text) > max_chars
-            return _ok(text=text[:max_chars], truncated=truncated, full_length=len(text))
+            end = min(len(text), offset + max_chars)
+            return _ok(
+                truncated=end < len(text),
+                full_length=len(text),
+                offset=offset,
+                next_offset=end if end < len(text) else None,
+                text=text[offset:end],
+            )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
+
+
+@mcp.tool()
+async def browser_get_text(
+    ctx: Context,
+    session_id: str = "",
+    selector: str = "",
+    max_chars: int = _DEFAULT_PAGE_CHARS,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Get paginated visible text from the single agent browser."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+    return await get_text(
+        sid, ctx, selector=selector, max_chars=max_chars, offset=offset
+    )
+
+
+@mcp.tool()
+async def find_text(
+    query: str,
+    ctx: Context,
+    session_id: str = "",
+    max_results: int = 20,
+    context_chars: int = 120,
+) -> Dict[str, Any]:
+    """Find text in the active page and return short surrounding snippets."""
+    if not query:
+        return _err("query must not be empty")
+    if error := _range_error("max_results", max_results, 1, 100):
+        return _err(error)
+    if error := _range_error("context_chars", context_chars, 20, 1000):
+        return _err(error)
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+        async with _use_page(sid) as (s, page):
+            try:
+                text = await page.inner_text("body")
+            except Exception as exc:
+                return _pw_err(s, "find_text", exc)
+            folded = text.casefold()
+            needle = query.casefold()
+            matches = []
+            start = 0
+            while len(matches) < max_results:
+                index = folded.find(needle, start)
+                if index < 0:
+                    break
+                left = max(0, index - context_chars)
+                right = min(len(text), index + len(query) + context_chars)
+                matches.append(
+                    {
+                        "offset": index,
+                        "snippet": text[left:right].replace("\n", " "),
+                    }
+                )
+                start = index + max(1, len(needle))
+            return _ok(query=query, count=len(matches), matches=matches)
+    except (KeyError, RuntimeError) as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
 
 
 @mcp.tool()
@@ -1597,11 +2298,14 @@ async def get_html(
     session_id: str,
     ctx: Context,
     selector: str = "",
-    max_chars: int = 20000,
+    max_chars: int = _DEFAULT_PAGE_CHARS,
+    offset: int = 0,
 ) -> Dict[str, Any]:
-    """Get HTML. Empty ``selector`` = full document (``page.content()``). Capped to ``max_chars``."""
+    """Get a page of HTML; use offset to continue. Full HTML is excluded from agent profile."""
     if error := _range_error("max_chars", max_chars, 0, _MAX_TEXT_CHARS):
         return _err(error)
+    if offset < 0:
+        return _err("offset must be non-negative")
     try:
         async with _use_page(session_id) as (s, page):
             try:
@@ -1613,8 +2317,14 @@ async def get_html(
                     html = await page.content()
             except Exception as exc:
                 return _pw_err(s, "get_html", exc)
-            truncated = len(html) > max_chars
-            return _ok(html=html[:max_chars], truncated=truncated, full_length=len(html))
+            end = min(len(html), offset + max_chars)
+            return _ok(
+                truncated=end < len(html),
+                full_length=len(html),
+                offset=offset,
+                next_offset=end if end < len(html) else None,
+                html=html[offset:end],
+            )
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
 
@@ -1754,6 +2464,22 @@ async def screenshot(
         raise RuntimeError(str(exc)) from exc
 
 
+@mcp.tool()
+async def browser_screenshot(
+    ctx: Context,
+    session_id: str = "",
+    full_page: bool = False,
+    image_format: Literal["jpeg", "jpg", "png"] = "jpeg",
+    quality: int = 85,
+) -> Image:
+    """Capture the single agent browser; session_id is usually omitted."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        raise RuntimeError(_sanitize_message(exc)) from exc
+    return await screenshot(sid, ctx, full_page, image_format, quality)
+
+
 # --------------------------------------------------------------------------- #
 # Waiting
 # --------------------------------------------------------------------------- #
@@ -1803,6 +2529,18 @@ async def wait_for_timeout(session_id: str, ms: int, ctx: Context) -> Dict[str, 
             return _ok(ms=ms)
     except (KeyError, RuntimeError) as exc:
         return _err(str(exc))
+
+
+@mcp.tool()
+async def browser_wait(
+    ms: int, ctx: Context, session_id: str = ""
+) -> Dict[str, Any]:
+    """Wait briefly in the single agent browser workflow."""
+    try:
+        sid = await _resolve_agent_session_id(session_id)
+    except KeyError as exc:
+        return _err(str(exc), code="SESSION_NOT_FOUND")
+    return await wait_for_timeout(sid, ms, ctx)
 
 
 # --------------------------------------------------------------------------- #
@@ -2054,7 +2792,7 @@ async def set_dialog_handler(
             return _err("session closed")
         s.dialog_action = action
         s.dialog_prompt_text = prompt_text
-        return _ok(action=action, prompt_text=prompt_text)
+        return _ok(action=action, prompt_length=len(prompt_text), redacted=True)
 
 
 @mcp.tool()

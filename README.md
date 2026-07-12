@@ -34,9 +34,13 @@ LLM ──MCP/stdio──► server ──► InvisiblePlaywright ──► patc
 ## Install
 
 ```bash
-pip install -e .                       # or: pip install spectra_mcp
+pip install -e .
 python -m invisible_playwright fetch   # one-time ~100 MB, SHA256-verified
 ```
+
+The patched browser dependency is pinned to an exact upstream Git commit so a
+clean install is reproducible. Installing directly from PyPI is not available
+until both projects have published releases.
 
 Requires Python 3.11+. Supported platforms: Windows x86_64, Linux x86_64/arm64,
 macOS arm64/x86_64.
@@ -93,19 +97,54 @@ If the console script isn't on `PATH`, use the module form instead:
 { "command": "python", "args": ["-m", "spectra_mcp"] }
 ```
 
+### Hermes Agent
+
+Use an absolute executable path because Hermes filters the subprocess
+environment. Browser calls within one session are serialized, so parallel tool
+calls must remain disabled.
+
+```yaml
+mcp_servers:
+  spectra_mcp:
+    command: /absolute/path/to/venv/bin/spectra_mcp
+    timeout: 300
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    env:
+      SPECTRA_MCP_TOOL_PROFILE: agent
+      SPECTRA_MCP_DATA_ROOT: /absolute/path/to/spectra-data
+```
+
+Hermes currently consumes text tool content more reliably than MCP image-only
+content. Use `browser_snapshot` as the primary observation and treat
+`browser_screenshot` as an optional vision capability. MCP stderr is written under
+`~/.hermes/logs/mcp-stderr.log`.
+
+### OpenClaw
+
+Register the stdio command with an absolute path, select the `agent` profile,
+and run OpenClaw's MCP doctor/probe after configuration. Increase the embedded
+MCP idle TTL when browser sessions must survive more than about ten idle
+minutes. Keep `supportsParallelToolCalls` disabled for this stateful server.
+
+OpenClaw may cap tool results to roughly 16K characters on smaller contexts;
+`browser_get_text` therefore defaults to paginated 8K results and `browser_snapshot`
+is preferred over full HTML.
+
 ---
 
 ## Quick start (for the LLM)
 
 1. **`fetch_binary`** (once) — download the patched Firefox if `binary_status`
    says `ready: false`.
-2. **`start_session`** → returns `session_id`, `seed`, and the initial
-   `page_id`. Pass a `proxy_server` for residential/socks proxies.
-3. **`goto`** a URL, then **`query_elements`** / **`get_text`** / **`screenshot`**
-   to understand the page.
-4. **`click`** / **`fill`** / **`press_key`** to act. Mouse motion is humanized.
-5. **`close_session`** when done (or just let the server shut down — the lifespan
-   cleans up all Firefox processes).
+2. **`browser_start`** → starts the single agent browser. Fingerprint profile,
+   timezone and locale are automatic by default.
+3. **`browser_navigate`**, then **`browser_snapshot`** to receive compact refs
+   such as `button "Sign in" [ref=e12ab34cd]`.
+4. Use **`click_ref`**, **`fill_ref`**, **`type_ref`**, **`select_ref`**, or
+   **`fill_form`**. Mutating ref actions return an updated snapshot by default.
+5. Use **`find_text`** or paginated **`browser_get_text`** for targeted reading.
+6. **`browser_stop`** when done. The server lifespan also cleans up Firefox.
 
 Log the `seed` to replay an identical fingerprint later (`start_session` with
 the same `seed`).
@@ -119,11 +158,17 @@ Tool exposure is selected at server startup with `SPECTRA_MCP_TOOL_PROFILE`:
 | Profile | Tools | Approx. tool tokens | Intended use |
 |---------|------:|--------------------:|--------------|
 | `setup` | 2 | ~230 | Binary status/download only. |
-| `core` | 28 | ~4,165 | Default. Setup plus normal browsing, reading, forms, tabs, screenshots and `evaluate`. |
-| `full` | 55 | ~7,942 | Every advanced mouse, keyboard, dialog, cookie/storage and frame tool. |
+| `agent` | 18 | varies | Default. Safe, compact single-browser workflow for AI agents. |
+| `core` | 28 | varies | Legacy selector workflow plus tabs, HTML and `evaluate`. |
+| `full` | 71 | varies | Agent, core and every advanced storage/frame/input tool. |
 
 Token estimates use the `o200k_base` tokenizer and an OpenAI-style function-tool
 payload. Exact numbers vary by MCP client and whether output schemas are included.
+
+`agent` includes `browser_start`, `browser_status`, `browser_stop`,
+`browser_navigate`, `browser_reload`, `browser_snapshot`, `snapshot_find`,
+`click_ref`, `fill_ref`, `type_ref`, `select_ref`, `fill_form`, `find_text`,
+paginated `browser_get_text`, `browser_screenshot`, `browser_wait` and binary setup.
 
 `core` includes session lifecycle, page switching/popups, `goto`/`reload`,
 `click`/`fill`/`type_text`/`press_key`, scrolling/hover/selects, text/HTML/
@@ -131,6 +176,7 @@ attribute/element reads, visibility, screenshots, waits and `evaluate`.
 
 ```bash
 SPECTRA_MCP_TOOL_PROFILE=core spectra_mcp
+SPECTRA_MCP_TOOL_PROFILE=agent spectra_mcp
 SPECTRA_MCP_TOOL_PROFILE=full spectra_mcp
 ```
 
@@ -159,6 +205,10 @@ tests but are not advertised to the model.
 | `list_sessions` | Active session ids. |
 | `session_info` | Session metadata, pages, active page id, URL and title. |
 
+Agent lifecycle tools `browser_start`, `browser_status`, and `browser_stop`
+automatically use the only live session, so the model does not need to preserve
+a random session id through context compaction.
+
 ### Pages
 | Tool | Description |
 |------|-------------|
@@ -169,6 +219,9 @@ tests but are not advertised to the model.
 ### Navigation
 `goto`, `go_forward`, `reload`
 
+`browser_navigate` and `browser_reload` are the single-session equivalents and
+include a fresh observation by default.
+
 ### Interaction (humanized)
 `click`, `fill`, `type_text`, `press_key`, `keyboard_press`, `select_option`,
 `hover`, `focus`, `check`, `uncheck`, `scroll`
@@ -176,17 +229,38 @@ tests but are not advertised to the model.
 ### Reading
 `get_text`, `get_html`, `get_attribute`, `query_elements`, `is_visible`
 
+`browser_snapshot` produces an accessibility-oriented list of visible controls
+and headings with stable refs. `snapshot_find` searches those refs without raw
+HTML. Ref mappings live only in server memory and do not add attributes or
+globals to the page. `find_text` returns short surrounding snippets.
+
+`get_text`, `browser_get_text`, and `get_html` support `offset`, `next_offset`, `full_length`, and
+`truncated`; their default page size is 8,000 characters.
+
 `query_elements` returns a structured snapshot (tag, id, name, type, role, href,
 text, value, placeholder, visible, bounding rect) so the LLM can decide what to
-click without scraping raw HTML.
+click without scraping raw HTML. Password input values are always redacted.
+
+### Ref interaction and forms
+
+`click_ref`, `fill_ref`, `type_ref`, `select_ref`, `fill_form`
+
+Refs come from `browser_snapshot`. A ref becomes invalid after switching pages
+or navigating without a new snapshot. Filled or typed values are never echoed
+into tool results; only their lengths are returned. `fill_form` accepts a list
+of `{ "ref": "...", "value": "..." }` objects.
 
 ### Screenshot
 `screenshot` → returns image content directly to the LLM. Defaults to JPEG
 (`quality=85`) to keep payloads small; `image_format="png"` for lossless.
 `full_page=True` captures the whole scrollable page.
 
+`browser_screenshot` is the single-session Agent equivalent.
+
 ### Waiting
 `wait_for_selector`, `wait_for_timeout`
+
+`browser_wait` is the single-session Agent equivalent of `wait_for_timeout`.
 
 `wait_for_selector` returns `reached=true` when the requested state is reached;
 `element_present` reports whether an element handle still exists (it is normally
@@ -241,15 +315,15 @@ with `>>>` to address nested iframes.
 | `headless` | `true` | Windows/macOS self-cloak the window. |
 | `proxy_server` | `""` | `socks5://host:1080`, `http://...`, etc. DNS routes via proxy. |
 | `proxy_username` / `proxy_password` | `""` | Proxy auth. |
-| `timezone` | `""` | IANA zone; empty = auto from egress IP. |
+| `timezone` | `""` | IANA zone; empty = auto from proxy/browser egress IP. |
 | `locale` | `"auto"` | `auto` = from egress country, or e.g. `en-US`. |
 | `humanize` | `true` | Bezier mouse paths + human timing. |
 | `profile_dir` | `""` | Persistent profile path (enables persistent context). |
 | `prep_recaptcha` | `false` | Pre-seed reCAPTCHA cookies (non-persistent only). |
 | `storage_state_path` | `""` | JSON file created by `save_storage_state`; cannot be combined with `profile_dir`. |
-| `fingerprint_profile` | `"windows"` | `windows` keeps the upstream persona; `linux_native` uses a Linux-coherent identity and Mesa GPU surface on Linux. |
+| `fingerprint_profile` | `"auto"` | Linux non-persistent sessions use `linux_native`; other cases use upstream `windows`. |
 
-On Linux hosts, `fingerprint_profile="linux_native"` avoids mixing a Windows
+On Linux hosts, automatic `fingerprint_profile="linux_native"` avoids mixing a Windows
 navigator identity with Linux font and graphics behavior. It currently supports
 non-persistent sessions only. The renderer persona is selected deterministically
 from the session seed so a replayed seed keeps the same public GPU identity.
@@ -257,6 +331,15 @@ This profile intentionally favors cross-surface consistency over fingerprint
 diversity: canvas, fonts, and most native Linux surfaces remain stable on one
 host, while the seed currently selects between a small validated renderer set.
 Use the upstream `windows` profile when broader per-seed variation matters more.
+
+Proxy credentials can be kept out of model tool-call history with
+`SPECTRA_MCP_PROXY_SERVER`, `SPECTRA_MCP_PROXY_USERNAME`, and
+`SPECTRA_MCP_PROXY_PASSWORD`. Explicit tool parameters override these defaults.
+Tool results and errors redact URL userinfo and authorization headers.
+
+Tool failures use MCP `isError=true` with a stable JSON message containing
+`code`, `message`, `retryable`, and `details`. Successful structured results use
+an unwrapped `{ "ok": true, ... }` envelope.
 
 ---
 
@@ -277,6 +360,8 @@ variables:
 - `SPECTRA_MCP_MAX_SCREENSHOT_BYTES=10485760`
 - `SPECTRA_MCP_MAX_SCREENSHOT_PIXELS=50000000`
 - `SPECTRA_MCP_MAX_EVALUATE_RESULT_BYTES=1048576`
+- `SPECTRA_MCP_DEFAULT_PAGE_CHARS=8000`
+- `SPECTRA_MCP_MAX_FORM_FIELDS=50`
 
 Set `SPECTRA_MCP_DATA_ROOT` to restrict `profile_dir`, storage-state input, and
 storage-state output to one filesystem tree. When it is unset, arbitrary local
