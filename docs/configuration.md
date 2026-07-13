@@ -50,7 +50,7 @@ export SPECTRA_MCP_PROXY_PASSWORD='password'
 
 The agent-facing `browser_start` always reads proxy credentials from these
 environment variables so secrets and infrastructure choices stay out of model
-tool calls. Advanced `start_session` arguments can override the environment.
+tool calls. Advanced `session_start` arguments can override the environment.
 Empty `timezone` and `locale="auto"` derive their values from the proxy/browser
 egress IP.
 

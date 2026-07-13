@@ -61,12 +61,14 @@ Client-specific examples:
 
 ## Agent workflow
 
-1. Call `binary_status`; use `fetch_binary` if needed.
+1. Call `binary_status`; use `binary_install` if needed.
 2. Call `browser_start`.
 3. Navigate with `browser_navigate`.
 4. Inspect the page with `browser_snapshot`.
-5. Act through `click_ref`, `fill_ref`, `type_ref`, `select_ref`, or `fill_form`.
-6. Use `browser_tabs` and `browser_switch_page` when a popup or new tab opens.
+5. Act through `browser_click_ref`, `browser_set_value_ref`,
+   `browser_type_text_ref`, `browser_select_option_ref`, or
+   `browser_set_form_values`.
+6. Use `browser_list_tabs` and `browser_activate_tab` when a popup or new tab opens.
 7. Use `browser_wait_for` for asynchronous text, URL, or element changes.
 8. Read targeted content with `browser_find_text` or paginated `browser_get_text`.
 9. Call `browser_stop` when finished.

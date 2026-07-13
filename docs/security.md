@@ -20,7 +20,8 @@ URL userinfo and authorization headers are redacted from normalized errors.
 
 ## Secret handling
 
-- `fill`, ref input tools, `fill_form`, and dialog configuration do not echo
+- `element_set_value`, ref input tools, `browser_set_form_values`, and dialog
+  configuration do not echo
   submitted values.
 - Password values are omitted from element snapshots.
 - Proxy credentials should use environment variables.
@@ -41,7 +42,7 @@ The default `agent` profile avoids raw HTML, arbitrary JavaScript evaluation,
 cookie mutation, storage-state access, and session enumeration.
 
 The `core` and `full` profiles expose more powerful capabilities. Only enable
-them for trusted agents and pages. In particular, `evaluate` executes arbitrary
+them for trusted agents and pages. In particular, `page_evaluate` executes arbitrary
 JavaScript in the active page.
 
 All server logging goes to stderr so it cannot corrupt stdio JSON-RPC.

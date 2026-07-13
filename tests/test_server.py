@@ -66,7 +66,7 @@ class _AsyncToolTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeRecoveryTests(_AsyncToolTest):
-    async def test_session_info_snapshots_pages_before_reading_entries(self):
+    async def test_session_status_snapshots_pages_before_reading_entries(self):
         class Page(_Page):
             session = None
 
@@ -79,24 +79,24 @@ class RuntimeRecoveryTests(_AsyncToolTest):
         session = await self.install_page("snapshot", page)
         page.session = session
 
-        result = await server.session_info("snapshot", _Ctx())
+        result = await server.session_status("snapshot", _Ctx())
 
         self.assertTrue(result["ok"])
         self.assertEqual([item["page_id"] for item in result["pages"]], [1])
 
-    async def test_close_page_preserves_registration_when_close_fails(self):
+    async def test_page_close_preserves_registration_when_close_fails(self):
         class Page(_Page):
             async def close(self):
                 raise ValueError("close failed")
 
         session = await self.install_page("close", Page())
-        result = await server.close_page("close", _Ctx())
+        result = await server.page_close("close", _Ctx())
 
         self.assertFalse(result["ok"])
         self.assertIn(1, session.pages)
         self.assertIs(session.pages[1], session.pages.get(session.active_page_id))
 
-    async def test_close_page_skips_closed_pages_when_selecting_active_page(self):
+    async def test_page_close_skips_closed_pages_when_selecting_active_page(self):
         class CloseablePage(_Page):
             async def close(self):
                 self.closed = True
@@ -112,7 +112,7 @@ class RuntimeRecoveryTests(_AsyncToolTest):
         session.pages[3] = live_page
         session.active_page_id = 2
 
-        result = await server.close_page("reselect", _Ctx())
+        result = await server.page_close("reselect", _Ctx())
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["active_page_id"], 3)
@@ -125,24 +125,24 @@ class RuntimeRecoveryTests(_AsyncToolTest):
 
         await self.install_page("broken-active", BrokenPage())
 
-        result = await server.get_text("broken-active", _Ctx())
+        result = await server.page_get_text("broken-active", _Ctx())
 
         self.assertFalse(result["ok"])
         self.assertIn("state check failed", result["error"])
 
-    async def test_switch_page_state_failure_returns_error_dict(self):
+    async def test_page_activate_state_failure_returns_error_dict(self):
         class BrokenPage(_Page):
             def is_closed(self):
                 raise ValueError("connection lost")
 
         await self.install_page("broken-switch", BrokenPage())
 
-        result = await server.switch_page("broken-switch", 1, _Ctx())
+        result = await server.page_activate("broken-switch", 1, _Ctx())
 
         self.assertFalse(result["ok"])
-        self.assertIn("switch_page failed", result["error"])
+        self.assertIn("page_activate failed", result["error"])
 
-    async def test_goto_keeps_success_when_title_lookup_fails(self):
+    async def test_page_navigate_keeps_success_when_title_lookup_fails(self):
         class Page(_Page):
             async def goto(self, *args, **kwargs):
                 return SimpleNamespace(status=200)
@@ -152,15 +152,17 @@ class RuntimeRecoveryTests(_AsyncToolTest):
 
         await self.install_page("goto", Page())
         try:
-            result = await server.goto("goto", "https://example.test/", _Ctx())
+            result = await server.page_navigate(
+                "goto", "https://example.test/", _Ctx()
+            )
         except Exception as exc:  # 当前缺陷会走到这里，转换成明确的测试失败。
-            self.fail(f"goto 泄漏异常：{exc}")
+            self.fail(f"page_navigate 泄漏异常：{exc}")
 
         self.assertTrue(result["ok"])
         self.assertIsNone(result["title"])
         self.assertIn("title failed", result["title_error"])
 
-    async def test_mouse_drag_releases_button_after_move_failure(self):
+    async def test_mouse_drag_between_releases_button_after_move_failure(self):
         class Mouse:
             def __init__(self) -> None:
                 self.moves = 0
@@ -181,7 +183,7 @@ class RuntimeRecoveryTests(_AsyncToolTest):
         page.mouse = Mouse()
         await self.install_page("drag", page)
 
-        result = await server.mouse_drag("drag", 0, 0, 10, 10, _Ctx())
+        result = await server.mouse_drag_between("drag", 0, 0, 10, 10, _Ctx())
 
         self.assertFalse(result["ok"])
         self.assertTrue(page.mouse.up_called)
@@ -254,7 +256,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
             patch.object(server, "LinuxNativePlaywright", FailConstructor),
             patch.object(server, "InvisiblePlaywright") as windows_constructor,
         ):
-            result = await server.start_session(_Ctx())
+            result = await server.session_start(_Ctx())
 
         self.assertFalse(result["ok"])
         self.assertIn("auto selected linux", result["error"])
@@ -270,7 +272,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
             patch.object(server, "LinuxNativePlaywright", FailConstructor),
             patch.object(server, "InvisiblePlaywright") as windows_constructor,
         ):
-            result = await server.start_session(
+            result = await server.session_start(
                 _Ctx(),
                 seed=15,
                 fingerprint_profile="linux_native",
@@ -281,7 +283,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
         windows_constructor.assert_not_called()
 
     async def test_linux_native_profile_rejects_persistent_profile(self):
-        result = await server.start_session(
+        result = await server.session_start(
             _Ctx(),
             profile_dir="/tmp/profile",
             fingerprint_profile="linux_native",
@@ -291,7 +293,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
         self.assertIn("does not support profile_dir", result["error"])
 
     async def test_unknown_fingerprint_profile_is_rejected(self):
-        result = await server.start_session(
+        result = await server.session_start(
             _Ctx(),
             fingerprint_profile="unknown",  # type: ignore[arg-type]
         )
@@ -299,7 +301,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
         self.assertFalse(result["ok"])
         self.assertIn("fingerprint_profile must be", result["error"])
 
-    async def test_start_session_cancellation_cleans_unpublished_browser(self):
+    async def test_session_start_cancellation_cleans_unpublished_browser(self):
         class Context:
             pages = []
 
@@ -324,12 +326,12 @@ class LifecycleHardeningTests(_AsyncToolTest):
             patch.object(server, "_binary_cache_guard", _noop_binary_guard),
         ):
             with self.assertRaises(asyncio.CancelledError):
-                await server.start_session(_Ctx(), fingerprint_profile="windows")
+                await server.session_start(_Ctx(), fingerprint_profile="windows")
 
         self.assertTrue(ipw.exit_called)
         self.assertEqual(server._SESSIONS, {})
 
-    async def test_close_session_retries_failed_browser_exit(self):
+    async def test_session_stop_retries_failed_browser_exit(self):
         class Page(_Page):
             def __init__(self):
                 super().__init__()
@@ -357,8 +359,8 @@ class LifecycleHardeningTests(_AsyncToolTest):
         async with server._LOCK:
             server._SESSIONS["retry"] = session
 
-        first = await server.close_session("retry", _Ctx())
-        second = await server.close_session("retry", _Ctx())
+        first = await server.session_stop("retry", _Ctx())
+        second = await server.session_stop("retry", _Ctx())
 
         self.assertFalse(first["ok"])
         self.assertFalse(first["cleanup_complete"])
@@ -396,13 +398,13 @@ class LifecycleHardeningTests(_AsyncToolTest):
             patch.object(server, "_MAX_SESSIONS", 1),
             patch.object(server, "InvisiblePlaywright") as constructor,
         ):
-            result = await server.start_session(_Ctx())
+            result = await server.session_start(_Ctx())
 
         self.assertFalse(result["ok"])
         self.assertIn("session limit", result["error"])
         constructor.assert_not_called()
 
-    async def test_new_page_limit_closes_untracked_page(self):
+    async def test_page_open_limit_closes_untracked_page(self):
         created = _Page()
 
         async def close():
@@ -414,7 +416,7 @@ class LifecycleHardeningTests(_AsyncToolTest):
         session.browser_or_ctx = SimpleNamespace(new_context=AsyncMock())
         session.primary_context = context
         with patch.object(server, "_MAX_PAGES_PER_SESSION", 1):
-            result = await server.new_page("page-limit", _Ctx())
+            result = await server.page_open("page-limit", _Ctx())
 
         self.assertFalse(result["ok"])
         self.assertIn("page limit", result["error"])
@@ -427,7 +429,7 @@ class BoundaryTests(_AsyncToolTest):
         page.evaluate = AsyncMock(return_value={"value": 1})
         await self.install_page("evaluate-zero", page)
 
-        result = await server.evaluate(
+        result = await server.page_evaluate(
             "evaluate-zero", "() => ({value: 1})", _Ctx(), timeout_ms=0
         )
 
@@ -439,7 +441,7 @@ class BoundaryTests(_AsyncToolTest):
         page.inner_text = AsyncMock(return_value="text")
         await self.install_page("output-limit", page)
 
-        result = await server.get_text(
+        result = await server.page_get_text(
             "output-limit", _Ctx(), max_chars=server._MAX_TEXT_CHARS + 1
         )
 
@@ -451,7 +453,7 @@ class BoundaryTests(_AsyncToolTest):
         page.wait_for_selector = AsyncMock(return_value=None)
         await self.install_page("hidden", page)
 
-        result = await server.wait_for_selector(
+        result = await server.element_wait_for(
             "hidden", "#gone", _Ctx(), state="hidden"
         )
 
@@ -466,7 +468,9 @@ class BoundaryTests(_AsyncToolTest):
         page.mouse = SimpleNamespace(wheel=AsyncMock())
         await self.install_page("scroll", page)
 
-        result = await server.scroll("scroll", _Ctx(), dy=100, selector="#missing")
+        result = await server.page_scroll(
+            "scroll", _Ctx(), dy=100, selector="#missing"
+        )
 
         self.assertFalse(result["ok"])
         page.mouse.wheel.assert_not_awaited()
@@ -480,7 +484,7 @@ class BoundaryTests(_AsyncToolTest):
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "nested" / "state.json"
 
-            result = await server.save_storage_state(
+            result = await server.storage_state_save(
                 "storage", str(target), _Ctx()
             )
 
@@ -499,7 +503,7 @@ class BoundaryTests(_AsyncToolTest):
         with tempfile.TemporaryDirectory() as tmpdir:
             outside = Path(tmpdir).parent / "outside-state.json"
             with patch.object(server, "_DATA_ROOT", tmpdir):
-                result = await server.save_storage_state(
+                result = await server.storage_state_save(
                     "root", str(outside), _Ctx()
                 )
 
@@ -512,7 +516,7 @@ class BoundaryTests(_AsyncToolTest):
             patch.object(server, "_binary_cache_guard", _noop_binary_guard),
             patch.object(server, "ensure_binary") as ensure,
         ):
-            result = await server.fetch_binary(_Ctx(), force=True)
+            result = await server.binary_install(_Ctx(), force=True)
 
         self.assertFalse(result["ok"])
         self.assertIn("sessions are active", result["error"])
@@ -555,7 +559,7 @@ class ContractTests(_AsyncToolTest):
     async def test_browser_start_keeps_agent_configuration_compact(self):
         with patch.object(
             server,
-            "start_session",
+            "session_start",
             AsyncMock(return_value={"ok": True, "session_id": "compact"}),
         ) as start:
             result = await server.browser_start(
@@ -595,20 +599,20 @@ class ContractTests(_AsyncToolTest):
         self.assertFalse(result["ok"])
         self.assertIn("at least one", result["error"])
 
-    async def test_fetch_binary_normalizes_download_failure(self):
+    async def test_binary_install_normalizes_download_failure(self):
         def fail(*args, **kwargs):
             raise ValueError("download failed")
 
         with patch.object(server, "ensure_binary", fail):
             try:
-                result = await server.fetch_binary(_Ctx())
+                result = await server.binary_install(_Ctx())
             except Exception as exc:
-                self.fail(f"fetch_binary 泄漏异常：{exc}")
+                self.fail(f"binary_install 泄漏异常：{exc}")
 
         self.assertFalse(result["ok"])
         self.assertIn("download failed", result["error"])
 
-    async def test_fetch_binary_serializes_shared_cache_mutation(self):
+    async def test_binary_install_serializes_shared_cache_mutation(self):
         state_lock = threading.Lock()
         active = 0
         max_active = 0
@@ -625,29 +629,29 @@ class ContractTests(_AsyncToolTest):
 
         with patch.object(server, "ensure_binary", ensure):
             results = await asyncio.gather(
-                server.fetch_binary(_Ctx()), server.fetch_binary(_Ctx())
+                server.binary_install(_Ctx()), server.binary_install(_Ctx())
             )
 
         self.assertTrue(all(result["ok"] for result in results))
         self.assertEqual(max_active, 1)
 
-    async def test_start_session_normalizes_constructor_failure(self):
+    async def test_session_start_normalizes_constructor_failure(self):
         class FailConstructor:
             def __init__(self, *args, **kwargs):
                 raise ValueError("bad launch option")
 
         with patch.object(server, "InvisiblePlaywright", FailConstructor):
             try:
-                result = await server.start_session(
+                result = await server.session_start(
                     _Ctx(), fingerprint_profile="windows"
                 )
             except Exception as exc:
-                self.fail(f"start_session 泄漏异常：{exc}")
+                self.fail(f"session_start 泄漏异常：{exc}")
 
         self.assertFalse(result["ok"])
         self.assertIn("bad launch option", result["error"])
 
-    async def test_close_session_reports_cleanup_failure(self):
+    async def test_session_stop_reports_cleanup_failure(self):
         class IPW:
             async def __aexit__(self, *args):
                 raise ValueError("browser exit failed")
@@ -659,7 +663,7 @@ class ContractTests(_AsyncToolTest):
         self.assertTrue(errors)
         self.assertIn("browser exit failed", errors[-1])
 
-    async def test_close_session_continues_when_page_state_check_fails(self):
+    async def test_session_stop_continues_when_page_state_check_fails(self):
         class Page:
             def __init__(self) -> None:
                 self.close_called = False
@@ -699,7 +703,9 @@ class ContractTests(_AsyncToolTest):
         page.locator = lambda selector: locator
         await self.install_page("visible", page)
 
-        result = await server.is_visible("visible", "#target", _Ctx(), timeout_ms=25)
+        result = await server.element_is_visible(
+            "visible", "#target", _Ctx(), timeout_ms=25
+        )
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["visible"])
@@ -713,7 +719,9 @@ class ContractTests(_AsyncToolTest):
         page.locator = lambda selector: locator
         await self.install_page("hidden", page)
 
-        result = await server.is_visible("hidden", "#target", _Ctx(), timeout_ms=25)
+        result = await server.element_is_visible(
+            "hidden", "#target", _Ctx(), timeout_ms=25
+        )
 
         self.assertTrue(result["ok"])
         self.assertFalse(result["visible"])
@@ -724,8 +732,8 @@ class ContractTests(_AsyncToolTest):
         page.evaluate = AsyncMock(return_value=[])
         await self.install_page("limits", page)
 
-        text_result = await server.get_text("limits", _Ctx(), max_chars=-1)
-        elements_result = await server.query_elements(
+        text_result = await server.page_get_text("limits", _Ctx(), max_chars=-1)
+        elements_result = await server.element_query(
             "limits", "div", _Ctx(), max_results=-1
         )
 
@@ -740,7 +748,7 @@ class ContractTests(_AsyncToolTest):
         await self.install_page("shot", page)
 
         with self.assertRaisesRegex(RuntimeError, "image_format"):
-            await server.screenshot("shot", _Ctx(), image_format="webp")
+            await server.page_screenshot("shot", _Ctx(), image_format="webp")
         page.screenshot.assert_not_awaited()
 
     def test_element_snapshot_checks_computed_visibility(self):
@@ -788,7 +796,7 @@ class ContractTests(_AsyncToolTest):
 
         snapshot = await server.browser_snapshot(_Ctx(), "snapshot-ref")
         ref = snapshot["elements"][0]["ref"]
-        result = await server.fill_ref(
+        result = await server.browser_set_value_ref(
             ref, "super-secret", _Ctx(), "snapshot-ref"
         )
 
@@ -807,8 +815,8 @@ class ContractTests(_AsyncToolTest):
         session = await self.install_page("tabs", first)
         session.pages[2] = second
 
-        listed = await server.browser_tabs(_Ctx(), "tabs")
-        switched = await server.browser_switch_page(2, _Ctx(), "tabs")
+        listed = await server.browser_list_tabs(_Ctx(), "tabs")
+        switched = await server.browser_activate_tab(2, _Ctx(), "tabs")
 
         self.assertTrue(listed["ok"])
         self.assertEqual([tab["page_id"] for tab in listed["tabs"]], [1, 2])
@@ -891,7 +899,7 @@ class ContractTests(_AsyncToolTest):
 
         snapshot = await server.browser_snapshot(_Ctx(), "frame-ref")
         ref = snapshot["elements"][0]["ref"]
-        result = await server.click_ref(ref, _Ctx(), "frame-ref")
+        result = await server.browser_click_ref(ref, _Ctx(), "frame-ref")
 
         self.assertTrue(snapshot["ok"])
         self.assertEqual(snapshot["frame_count"], 1)
@@ -949,7 +957,7 @@ class ContractTests(_AsyncToolTest):
 
         first = await server.browser_snapshot(_Ctx(), "snapshot-history")
         second = await server.browser_snapshot(_Ctx(), "snapshot-history")
-        result = await server.click_ref(
+        result = await server.browser_click_ref(
             first["elements"][0]["ref"],
             _Ctx(),
             "snapshot-history",
@@ -1009,7 +1017,7 @@ class ContractTests(_AsyncToolTest):
         page.inner_text = AsyncMock(return_value="abcdefghij")
         await self.install_page("paginate", page)
 
-        result = await server.get_text(
+        result = await server.page_get_text(
             "paginate", _Ctx(), max_chars=4, offset=3
         )
 
@@ -1145,25 +1153,45 @@ class MetadataTests(unittest.TestCase):
                 names = json.loads(output)
                 self.assertEqual(len(names), expected_count)
                 if profile == "setup":
-                    self.assertEqual(names, ["binary_status", "fetch_binary"])
+                    self.assertEqual(names, ["binary_status", "binary_install"])
                 if profile == "core":
-                    self.assertIn("start_session", names)
-                    self.assertIn("scroll", names)
+                    self.assertIn("session_start", names)
+                    self.assertIn("page_scroll", names)
                     self.assertNotIn("frame_click", names)
                 if profile == "agent":
                     self.assertIn("browser_snapshot", names)
-                    self.assertIn("fill_form", names)
-                    self.assertIn("browser_tabs", names)
-                    self.assertIn("browser_switch_page", names)
+                    self.assertIn("browser_set_form_values", names)
+                    self.assertIn("browser_list_tabs", names)
+                    self.assertIn("browser_activate_tab", names)
                     self.assertIn("browser_wait_for", names)
                     self.assertIn("browser_find_text", names)
                     self.assertNotIn("browser_wait", names)
                     self.assertNotIn("snapshot_find", names)
                     self.assertNotIn("find_text", names)
-                    self.assertNotIn("evaluate", names)
+                    self.assertNotIn("page_evaluate", names)
                 if profile == "full":
                     self.assertIn("frame_click", names)
-                    self.assertIn("save_storage_state", names)
+                    self.assertIn("storage_state_save", names)
+                    legacy_names = {
+                        "fetch_binary", "start_session", "close_session",
+                        "list_sessions", "session_info", "browser_tabs",
+                        "browser_switch_page", "click_ref", "fill_ref",
+                        "type_ref", "select_ref", "fill_form", "new_page",
+                        "close_page", "switch_page", "goto", "go_forward",
+                        "reload", "click", "fill", "type_text", "press_key",
+                        "keyboard_press", "select_option", "hover", "focus",
+                        "check", "uncheck", "scroll", "get_text", "get_html",
+                        "get_attribute", "query_elements", "is_visible",
+                        "screenshot", "wait_for_selector", "wait_for_timeout",
+                        "browser_wait", "evaluate", "mouse_drag", "mouse_move",
+                        "mouse_click", "keyboard_down", "keyboard_up",
+                        "keyboard_type", "set_dialog_handler", "get_dialogs",
+                        "wait_for_page", "get_cookies", "add_cookies",
+                        "clear_cookies", "save_storage_state", "list_frames",
+                        "frame_fill", "frame_type", "frame_wait_for_selector",
+                        "frame_query_elements",
+                    }
+                    self.assertTrue(legacy_names.isdisjoint(names))
 
     def test_tool_schema_exposes_enum_constraints(self):
         script = (
@@ -1179,15 +1207,15 @@ class MetadataTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            tools["click"]["properties"]["button"]["enum"],
+            tools["element_click"]["properties"]["button"]["enum"],
             ["left", "middle", "right"],
         )
         self.assertEqual(
-            tools["wait_for_selector"]["properties"]["state"]["enum"],
+            tools["element_wait_for"]["properties"]["state"]["enum"],
             ["attached", "detached", "hidden", "visible"],
         )
         self.assertEqual(
-            tools["click_ref"]["properties"]["observe"]["enum"],
+            tools["browser_click_ref"]["properties"]["observe"]["enum"],
             ["none", "compact", "full"],
         )
 
@@ -1228,14 +1256,14 @@ class MetadataTests(unittest.TestCase):
             )
         )
 
-        fill_schema = tools["fill_form"]["input"]
+        fill_schema = tools["browser_set_form_values"]["input"]
         form_ref = fill_schema["properties"]["fields"]["items"]["$ref"]
         form_name = form_ref.rsplit("/", 1)[-1]
         form = fill_schema["$defs"][form_name]
         self.assertEqual(set(form["required"]), {"ref", "value"})
         self.assertFalse(form["additionalProperties"])
 
-        cookie_schema = tools["add_cookies"]["input"]
+        cookie_schema = tools["cookie_add"]["input"]
         cookie_items = cookie_schema["properties"]["cookies"]["items"]
         self.assertIn("anyOf", cookie_items)
 

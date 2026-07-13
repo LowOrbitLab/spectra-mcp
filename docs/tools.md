@@ -14,12 +14,28 @@ server after changing it.
 SPECTRA_MCP_TOOL_PROFILE=agent spectra_mcp
 ```
 
+## Naming convention
+
+Public tools use `<scope>_<action>[_<object>]` names:
+
+- `binary_*` manages the patched browser binary.
+- `browser_*` is the agent-facing, implicit single-browser/ref workflow.
+- `session_*` manages explicit multi-session state.
+- `page_*` manages explicit pages, navigation, page content, and page waits.
+- `element_*` targets CSS selectors in the active page.
+- `frame_*` targets selectors inside an iframe.
+- `mouse_*` and `keyboard_*` expose device-level input.
+- `dialog_*`, `cookie_*`, and `storage_state_*` expose context state.
+
+The server registers only these canonical names; legacy tool aliases are not
+advertised or retained.
+
 ## Agent profile
 
 ### Setup
 
 - `binary_status` checks whether patched Firefox is available.
-- `fetch_binary` downloads and verifies it. `force=true` replaces the cache.
+- `binary_install` downloads and verifies it. `force=true` replaces the cache.
 
 ### Browser lifecycle
 
@@ -28,8 +44,8 @@ SPECTRA_MCP_TOOL_PROFILE=agent spectra_mcp
   configuration comes from the server environment.
 - `browser_status` returns its current page, humanization setting, dialog
   policy, and the page capabilities exposed by the active tool profile.
-- `browser_tabs` lists open tabs and the active tab.
-- `browser_switch_page` switches to a tab by `page_id`.
+- `browser_list_tabs` lists open tabs and the active tab.
+- `browser_activate_tab` activates a tab by `page_id`.
 - `browser_stop` closes it.
 
 Agent tools automatically select the only live session. Their optional
@@ -66,11 +82,11 @@ silently omitted.
 
 ### Interaction
 
-- `click_ref`
-- `fill_ref`
-- `type_ref`
-- `select_ref`
-- `fill_form`
+- `browser_click_ref`
+- `browser_set_value_ref`
+- `browser_type_text_ref`
+- `browser_select_option_ref`
+- `browser_set_form_values`
 
 Navigation and mutating ref actions accept `observe="none"`, `"compact"`, or
 `"full"`. The default `compact` response refreshes refs and returns the textual
@@ -78,7 +94,7 @@ snapshot without duplicating the structured element/frame arrays. `full`
 returns the complete snapshot; `none` skips observation. Filled and typed
 values are never echoed; results contain only their lengths.
 
-`fill_form` accepts:
+`browser_set_form_values` accepts:
 
 ```json
 {
@@ -106,31 +122,34 @@ The default page size is 8,000 characters.
 
 The lower-level API uses explicit session IDs and CSS selectors.
 
-- Lifecycle: `start_session`, `close_session`, `list_sessions`, `session_info`
-- Pages: `new_page`, `close_page`, `switch_page`, `wait_for_page`
-- Navigation: `goto`, `go_forward`, `reload`
-- Interaction: `click`, `fill`, `type_text`, `press_key`, `keyboard_press`,
-  `select_option`, `hover`, `focus`, `check`, `uncheck`, `scroll`
-- Reading: `get_text`, `get_html`, `get_attribute`, `query_elements`, `is_visible`
-- Waiting: `wait_for_selector`, `wait_for_timeout`
-- JavaScript: `evaluate`
-- Mouse: `mouse_drag`, `mouse_move`, `mouse_click`
-- Keyboard: `keyboard_down`, `keyboard_up`, `keyboard_type`
-- Dialogs: `set_dialog_handler`, `get_dialogs`
-- Cookies/state: `get_cookies`, `add_cookies`, `clear_cookies`,
-  `save_storage_state`
-- Frames: `list_frames`, `frame_click`, `frame_fill`, `frame_type`,
-  `frame_get_text`, `frame_wait_for_selector`, `frame_query_elements`,
+- Lifecycle: `session_start`, `session_stop`, `session_list`, `session_status`
+- Pages: `page_open`, `page_close`, `page_activate`, `session_wait_for_new_page`
+- Navigation: `page_navigate`, `page_go_forward`, `page_reload`
+- Interaction: `element_click`, `element_set_value`, `element_type_text`,
+  `element_press_key`, `keyboard_press_key`, `element_select_option`,
+  `element_hover`, `element_focus`, `element_check`, `element_uncheck`,
+  `page_scroll`
+- Reading: `page_get_text`, `page_get_html`, `element_get_attribute`,
+  `element_query`, `element_is_visible`
+- Waiting: `element_wait_for`, `page_sleep`, `browser_sleep`, `browser_wait_for`
+- JavaScript: `page_evaluate`
+- Mouse: `mouse_drag_between`, `mouse_move_to`, `mouse_click_at`
+- Keyboard: `keyboard_key_down`, `keyboard_key_up`, `keyboard_type_text`
+- Dialogs: `dialog_set_policy`, `dialog_list`
+- Cookies/state: `cookie_list`, `cookie_add`, `cookie_clear`,
+  `storage_state_save`
+- Frames: `page_list_frames`, `frame_click`, `frame_set_value`,
+  `frame_type_text`, `frame_get_text`, `frame_wait_for`, `frame_query`,
   `frame_evaluate`, `frame_get_html`, `frame_get_attribute`
-- Screenshot: `screenshot`
+- Screenshot: `page_screenshot`
 
-`evaluate`, raw HTML, cookies, storage state, and arbitrary filesystem paths are
+`page_evaluate`, raw HTML, cookies, storage state, and arbitrary filesystem paths are
 intended for trusted full-profile workflows.
 
-`add_cookies` accepts either `{name, value, url}` cookies or
+`cookie_add` accepts either `{name, value, url}` cookies or
 `{name, value, domain, path}` cookies, plus optional Playwright cookie flags.
 
 Storage state contains cookies and localStorage. Treat it as a secret. Save it
-with `save_storage_state` and restore it with
-`start_session` with `storage_state_path`. Files are atomically replaced and use
+with `storage_state_save` and restore it with
+`session_start` with `storage_state_path`. Files are atomically replaced and use
 mode `0600` on Unix.

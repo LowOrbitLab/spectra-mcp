@@ -1,6 +1,6 @@
 # Fingerprint and geo behavior
 
-`browser_start` and `start_session` default to:
+`browser_start` and `session_start` default to:
 
 ```text
 fingerprint_profile = auto

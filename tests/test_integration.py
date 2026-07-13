@@ -45,7 +45,7 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_persistent_context_adopts_initial_page(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = await server.start_session(
+            result = await server.session_start(
                 _Ctx(),
                 headless=True,
                 humanize=False,
@@ -62,10 +62,10 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(session.browser_or_ctx.pages), 1)
                 self.assertEqual(len(session.pages), 1)
             finally:
-                await server.close_session(session_id, _Ctx())
+                await server.session_stop(session_id, _Ctx())
 
     async def test_browser_disconnect_preserves_tool_error_contract(self):
-        result = await server.start_session(
+        result = await server.session_start(
             _Ctx(),
             headless=True,
             humanize=False,
@@ -77,7 +77,7 @@ class BrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session = server._SESSIONS[session_id]
 
         await session.browser_or_ctx.close()
-        tool_result = await server.get_text(session_id, _Ctx())
+        tool_result = await server.page_get_text(session_id, _Ctx())
 
         self.assertIsInstance(tool_result, dict)
         self.assertFalse(tool_result["ok"])
