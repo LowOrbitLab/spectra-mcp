@@ -552,6 +552,49 @@ class BoundaryTests(_AsyncToolTest):
 
 
 class ContractTests(_AsyncToolTest):
+    async def test_browser_start_keeps_agent_configuration_compact(self):
+        with patch.object(
+            server,
+            "start_session",
+            AsyncMock(return_value={"ok": True, "session_id": "compact"}),
+        ) as start:
+            result = await server.browser_start(
+                _Ctx(), seed=12, headless=False, humanize=False
+            )
+
+        self.assertTrue(result["ok"])
+        start.assert_awaited_once_with(
+            unittest.mock.ANY,
+            seed=12,
+            headless=False,
+            humanize=False,
+            fingerprint_profile="auto",
+        )
+
+    async def test_browser_wait_for_uses_page_conditions(self):
+        page = _Page()
+        page.url = "https://example.test/ready"
+        page.inner_text = AsyncMock(side_effect=["Loading", "Everything Ready"])
+        await self.install_page("wait-condition", page)
+
+        result = await server.browser_wait_for(
+            _Ctx(),
+            text="ready",
+            url="/ready",
+            session_id="wait-condition",
+            timeout_ms=1000,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["matched"])
+        self.assertEqual(page.inner_text.await_count, 2)
+
+    async def test_browser_wait_for_requires_a_condition(self):
+        result = await server.browser_wait_for(_Ctx())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("at least one", result["error"])
+
     async def test_fetch_binary_normalizes_download_failure(self):
         def fail(*args, **kwargs):
             raise ValueError("download failed")
@@ -715,6 +758,7 @@ class ContractTests(_AsyncToolTest):
             "items": [
                 {
                     "selector": "#password",
+                    "tag": "input",
                     "role": "textbox",
                     "name": "Password",
                     "disabled": False,
@@ -731,7 +775,7 @@ class ContractTests(_AsyncToolTest):
             count=AsyncMock(return_value=1),
             evaluate=AsyncMock(
                 return_value={
-                    "tag": "",
+                    "tag": "input",
                     "role": "textbox",
                     "name": "Password",
                     "visible": True,
@@ -752,6 +796,46 @@ class ContractTests(_AsyncToolTest):
         self.assertEqual(result["length"], 12)
         self.assertNotIn("super-secret", json.dumps(result))
         locator.fill.assert_awaited_once_with("super-secret", timeout=30000)
+
+    async def test_agent_can_list_and_switch_tabs(self):
+        first = _Page()
+        first.url = "https://first.test/"
+        first.title = AsyncMock(return_value="First")
+        second = _Page()
+        second.url = "https://second.test/"
+        second.title = AsyncMock(return_value="Second")
+        session = await self.install_page("tabs", first)
+        session.pages[2] = second
+
+        listed = await server.browser_tabs(_Ctx(), "tabs")
+        switched = await server.browser_switch_page(2, _Ctx(), "tabs")
+
+        self.assertTrue(listed["ok"])
+        self.assertEqual([tab["page_id"] for tab in listed["tabs"]], [1, 2])
+        self.assertEqual(listed["active_page_id"], 1)
+        self.assertTrue(switched["ok"])
+        self.assertEqual(switched["active_page_id"], 2)
+        self.assertEqual(session.active_page_id, 2)
+
+    async def test_browser_status_exposes_effective_policy_and_capabilities(self):
+        page = _Page()
+        page.title = AsyncMock(return_value="Status")
+        session = await self.install_page("status-fields", page)
+        session.humanize = False
+        session.dialog_action = "dismiss"
+        session.dialog_prompt_text = "configured"
+
+        result = await server.browser_status(_Ctx(), "status-fields")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["humanize"])
+        self.assertEqual(
+            result["dialog_policy"],
+            {"action": "dismiss", "prompt_text_configured": True},
+        )
+        self.assertTrue(result["page_capabilities"]["active_page"])
+        self.assertTrue(result["page_capabilities"]["snapshot_refs"])
+        self.assertTrue(result["page_capabilities"]["tabs"])
 
     async def test_agent_snapshot_and_click_ref_include_child_frames(self):
         top_raw = {
@@ -811,12 +895,71 @@ class ContractTests(_AsyncToolTest):
 
         self.assertTrue(snapshot["ok"])
         self.assertEqual(snapshot["frame_count"], 1)
-        self.assertTrue(ref.startswith("f1:"))
+        self.assertIn(":f1:", ref)
         self.assertIn('iframe "payment" [frame=f1]', snapshot["snapshot"])
         self.assertTrue(result["ok"])
         locator.click.assert_awaited_once_with(timeout=30000)
         page.evaluate.assert_any_await(server._SNAPSHOT_JS, 80)
         child_frame.evaluate.assert_any_await(server._SNAPSHOT_JS, 40)
+
+    async def test_recent_snapshot_refs_remain_usable_per_page(self):
+        first_raw = {
+            "title": "Page",
+            "url": "https://example.test/",
+            "total_candidates": 1,
+            "items": [
+                {
+                    "selector": "#first",
+                    "tag": "button",
+                    "role": "button",
+                    "name": "First",
+                    "disabled": False,
+                    "checked": None,
+                    "selected": None,
+                    "value": None,
+                }
+            ],
+        }
+        second_raw = {
+            **first_raw,
+            "items": [
+                {
+                    **first_raw["items"][0],
+                    "selector": "#second",
+                    "name": "Second",
+                }
+            ],
+        }
+        first_locator = SimpleNamespace(
+            count=AsyncMock(return_value=1),
+            evaluate=AsyncMock(
+                return_value={
+                    "tag": "button",
+                    "role": "button",
+                    "name": "First",
+                    "visible": True,
+                }
+            ),
+            click=AsyncMock(return_value=None),
+        )
+        page = _Page()
+        page.evaluate = AsyncMock(side_effect=[first_raw, second_raw])
+        page.locator = lambda selector: first_locator
+        await self.install_page("snapshot-history", page)
+
+        first = await server.browser_snapshot(_Ctx(), "snapshot-history")
+        second = await server.browser_snapshot(_Ctx(), "snapshot-history")
+        result = await server.click_ref(
+            first["elements"][0]["ref"],
+            _Ctx(),
+            "snapshot-history",
+            observe="none",
+        )
+
+        self.assertNotEqual(first["snapshot_id"], second["snapshot_id"])
+        self.assertTrue(first["elements"][0]["ref"].startswith(first["snapshot_id"]))
+        self.assertTrue(result["ok"])
+        first_locator.click.assert_awaited_once_with(timeout=30000)
 
     async def test_agent_snapshot_reports_inaccessible_frames(self):
         top_raw = {
@@ -874,6 +1017,58 @@ class ContractTests(_AsyncToolTest):
         self.assertEqual(result["next_offset"], 7)
         self.assertTrue(result["truncated"])
 
+    async def test_browser_snapshot_filters_controls_without_separate_tool(self):
+        raw = {
+            "title": "Actions",
+            "url": "https://example.test/",
+            "total_candidates": 2,
+            "items": [
+                {
+                    "selector": "#save",
+                    "tag": "button",
+                    "role": "button",
+                    "name": "Save changes",
+                    "disabled": False,
+                    "checked": None,
+                    "selected": None,
+                    "value": None,
+                },
+                {
+                    "selector": "#cancel",
+                    "tag": "button",
+                    "role": "button",
+                    "name": "Cancel",
+                    "disabled": False,
+                    "checked": None,
+                    "selected": None,
+                    "value": None,
+                },
+            ],
+        }
+        page = _Page()
+        page.evaluate = AsyncMock(return_value=raw)
+        await self.install_page("snapshot-filter", page)
+
+        result = await server.browser_snapshot(
+            _Ctx(), "snapshot-filter", query="save", role="button"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["match_count"], 1)
+        self.assertEqual(result["matches"][0]["name"], "Save changes")
+
+    async def test_browser_find_text_uses_explicit_agent_name(self):
+        page = _Page()
+        page.inner_text = AsyncMock(return_value="Alpha target Omega")
+        await self.install_page("find-text", page)
+
+        result = await server.browser_find_text(
+            "target", _Ctx(), "find-text"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 1)
+
     async def test_protocol_boundary_turns_error_dict_into_tool_error(self):
         tool = server.mcp._tool_manager._tools["browser_status"]
         with self.assertRaises(ToolError) as caught:
@@ -888,6 +1083,9 @@ class ContractTests(_AsyncToolTest):
         schema = tool.output_schema
 
         self.assertIn("session_id", schema["properties"])
+        self.assertIn("humanize", schema["properties"])
+        self.assertIn("dialog_policy", schema["properties"])
+        self.assertIn("page_capabilities", schema["properties"])
         self.assertNotIn("result", schema["properties"])
 
     def test_agent_browser_tools_do_not_require_session_id(self):
@@ -895,6 +1093,15 @@ class ContractTests(_AsyncToolTest):
         for tool in tools:
             if tool.name.startswith("browser_"):
                 self.assertNotIn("session_id", tool.inputSchema.get("required", []))
+
+    def test_browser_start_schema_has_only_agent_level_options(self):
+        tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+        tool = tools["browser_start"]
+
+        self.assertEqual(
+            set(tool.inputSchema["properties"]),
+            {"seed", "headless", "humanize", "fingerprint_profile"},
+        )
 
     def test_error_sanitizer_redacts_url_credentials_and_auth_headers(self):
         message = server._sanitize_message(
@@ -910,7 +1117,7 @@ class ContractTests(_AsyncToolTest):
 class MetadataTests(unittest.TestCase):
     def test_every_registered_tool_has_a_description(self):
         tools = asyncio.run(server.mcp.list_tools())
-        expected_counts = {"setup": 2, "agent": 18, "core": 28, "full": 71}
+        expected_counts = {"setup": 2, "agent": 19, "core": 28, "full": 73}
         self.assertEqual(len(tools), expected_counts[server._TOOL_PROFILE])
         self.assertEqual(
             [tool.name for tool in tools if not (tool.description or "").strip()], []
@@ -921,7 +1128,7 @@ class MetadataTests(unittest.TestCase):
             "import asyncio,json; import spectra_mcp.server as s; "
             "print(json.dumps([t.name for t in asyncio.run(s.mcp.list_tools())]))"
         )
-        expected_counts = {"setup": 2, "agent": 18, "core": 28, "full": 71}
+        expected_counts = {"setup": 2, "agent": 19, "core": 28, "full": 73}
         for profile, expected_count in expected_counts.items():
             with self.subTest(profile=profile):
                 env = os.environ.copy()
@@ -946,6 +1153,13 @@ class MetadataTests(unittest.TestCase):
                 if profile == "agent":
                     self.assertIn("browser_snapshot", names)
                     self.assertIn("fill_form", names)
+                    self.assertIn("browser_tabs", names)
+                    self.assertIn("browser_switch_page", names)
+                    self.assertIn("browser_wait_for", names)
+                    self.assertIn("browser_find_text", names)
+                    self.assertNotIn("browser_wait", names)
+                    self.assertNotIn("snapshot_find", names)
+                    self.assertNotIn("find_text", names)
                     self.assertNotIn("evaluate", names)
                 if profile == "full":
                     self.assertIn("frame_click", names)
@@ -957,7 +1171,7 @@ class MetadataTests(unittest.TestCase):
             "print(json.dumps({t.name:t.inputSchema for t in asyncio.run(s.mcp.list_tools())}))"
         )
         env = os.environ.copy()
-        env["SPECTRA_MCP_TOOL_PROFILE"] = "core"
+        env["SPECTRA_MCP_TOOL_PROFILE"] = "full"
         env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
         tools = json.loads(
             subprocess.check_output(
@@ -971,6 +1185,68 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(
             tools["wait_for_selector"]["properties"]["state"]["enum"],
             ["attached", "detached", "hidden", "visible"],
+        )
+        self.assertEqual(
+            tools["click_ref"]["properties"]["observe"]["enum"],
+            ["none", "compact", "full"],
+        )
+
+    def test_observation_modes_control_snapshot_detail(self):
+        snapshot = {
+            "ok": True,
+            "session_id": "s",
+            "snapshot_id": "p1s1",
+            "page_id": 1,
+            "url": "https://example.test/",
+            "title": "Example",
+            "count": 1,
+            "frame_count": 0,
+            "truncated": False,
+            "snapshot": '- button "Go" [ref=p1s1:e1]',
+            "elements": [{"ref": "p1s1:e1"}],
+            "frames": [],
+        }
+
+        self.assertIsNone(server._observation_payload(snapshot, "none"))
+        compact = server._observation_payload(snapshot, "compact")
+        self.assertNotIn("elements", compact)
+        self.assertNotIn("frames", compact)
+        self.assertIs(server._observation_payload(snapshot, "full"), snapshot)
+
+    def test_structured_tool_schemas_are_precise(self):
+        script = (
+            "import asyncio,json; import spectra_mcp.server as s; "
+            "print(json.dumps({t.name:{'input':t.inputSchema,'output':t.outputSchema} "
+            "for t in asyncio.run(s.mcp.list_tools())}))"
+        )
+        env = os.environ.copy()
+        env["SPECTRA_MCP_TOOL_PROFILE"] = "full"
+        env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+        tools = json.loads(
+            subprocess.check_output(
+                [sys.executable, "-c", script], cwd=ROOT, env=env, text=True
+            )
+        )
+
+        fill_schema = tools["fill_form"]["input"]
+        form_ref = fill_schema["properties"]["fields"]["items"]["$ref"]
+        form_name = form_ref.rsplit("/", 1)[-1]
+        form = fill_schema["$defs"][form_name]
+        self.assertEqual(set(form["required"]), {"ref", "value"})
+        self.assertFalse(form["additionalProperties"])
+
+        cookie_schema = tools["add_cookies"]["input"]
+        cookie_items = cookie_schema["properties"]["cookies"]["items"]
+        self.assertIn("anyOf", cookie_items)
+
+        snapshot_schema = tools["browser_snapshot"]["output"]
+        self.assertEqual(
+            snapshot_schema["properties"]["elements"]["items"]["$ref"],
+            "#/$defs/SnapshotElement",
+        )
+        self.assertEqual(
+            snapshot_schema["properties"]["frames"]["items"]["$ref"],
+            "#/$defs/SnapshotFrame",
         )
 
     def test_documentation_mentions_every_tool_and_storage_state_parameter(self):

@@ -20,7 +20,8 @@ Recommended behavior:
 - Run OpenClaw's MCP doctor/probe after configuration.
 - Increase the embedded MCP idle TTL when browser sessions must survive more
   than roughly ten idle minutes.
-- Prefer `browser_snapshot`, `find_text`, and paginated `browser_get_text`.
+- Prefer filtered `browser_snapshot`, `browser_find_text`, and paginated
+  `browser_get_text`.
 - Avoid large raw HTML results. OpenClaw may cap tool results around 16K
   characters on smaller model contexts.
 

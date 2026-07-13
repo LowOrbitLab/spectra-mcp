@@ -66,12 +66,15 @@ Client-specific examples:
 3. Navigate with `browser_navigate`.
 4. Inspect the page with `browser_snapshot`.
 5. Act through `click_ref`, `fill_ref`, `type_ref`, `select_ref`, or `fill_form`.
-6. Read targeted content with `find_text` or paginated `browser_get_text`.
-7. Call `browser_stop` when finished.
+6. Use `browser_tabs` and `browser_switch_page` when a popup or new tab opens.
+7. Use `browser_wait_for` for asynchronous text, URL, or element changes.
+8. Read targeted content with `browser_find_text` or paginated `browser_get_text`.
+9. Call `browser_stop` when finished.
 
-Mutating ref actions return a refreshed snapshot by default. Agent tools
-automatically use the only live session, so models normally do not need to
-remember a session ID.
+Mutating ref actions return a compact refreshed snapshot by default; use
+`observe="full"` for structured element/frame arrays or `observe="none"` to
+skip observation. Agent tools automatically use the only live session, so
+models normally do not need to remember a session ID.
 
 ## Documentation
 

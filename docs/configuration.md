@@ -48,7 +48,9 @@ export SPECTRA_MCP_PROXY_USERNAME='username'
 export SPECTRA_MCP_PROXY_PASSWORD='password'
 ```
 
-Explicit `browser_start`/`start_session` arguments override the environment.
+The agent-facing `browser_start` always reads proxy credentials from these
+environment variables so secrets and infrastructure choices stay out of model
+tool calls. Advanced `start_session` arguments can override the environment.
 Empty `timezone` and `locale="auto"` derive their values from the proxy/browser
 egress IP.
 
@@ -79,6 +81,7 @@ The default is `agent`.
 | `SPECTRA_MCP_MAX_FORM_FIELDS` | `50` |
 | `SPECTRA_MCP_MAX_SNAPSHOT_FRAMES` | `32` |
 | `SPECTRA_MCP_MAX_FRAME_DEPTH` | `8` |
+| `SPECTRA_MCP_MAX_SNAPSHOT_MAPS_PER_PAGE` | `4` |
 
 Set `SPECTRA_MCP_DATA_ROOT` to restrict persistent profiles and storage-state
 input/output to one filesystem tree.

@@ -6,9 +6,9 @@ server after changing it.
 | Profile | Tools | Purpose |
 |---|---:|---|
 | `setup` | 2 | Browser binary status and download only |
-| `agent` | 18 | Default compact workflow for AI agents |
+| `agent` | 19 | Default compact workflow for AI agents |
 | `core` | 28 | Selector-based browsing, tabs, HTML, and JavaScript |
-| `full` | 71 | Every agent, storage, frame, mouse, and keyboard tool |
+| `full` | 73 | Every agent, storage, frame, mouse, and keyboard tool |
 
 ```bash
 SPECTRA_MCP_TOOL_PROFILE=agent spectra_mcp
@@ -23,8 +23,13 @@ SPECTRA_MCP_TOOL_PROFILE=agent spectra_mcp
 
 ### Browser lifecycle
 
-- `browser_start` launches the single Agent browser.
-- `browser_status` returns its current page and session state.
+- `browser_start` launches the single Agent browser. It exposes only seed,
+  headless, humanization, and fingerprint profile controls; proxy and geo
+  configuration comes from the server environment.
+- `browser_status` returns its current page, humanization setting, dialog
+  policy, and the page capabilities exposed by the active tool profile.
+- `browser_tabs` lists open tabs and the active tab.
+- `browser_switch_page` switches to a tab by `page_id`.
 - `browser_stop` closes it.
 
 Agent tools automatically select the only live session. Their optional
@@ -34,8 +39,8 @@ Agent tools automatically select the only live session. Their optional
 
 - `browser_navigate` navigates and returns a fresh observation by default.
 - `browser_reload` reloads and returns a fresh observation.
-- `browser_snapshot` returns visible controls and headings with stable refs.
-- `snapshot_find` searches accessible names, values, and roles.
+- `browser_snapshot` returns visible controls and headings with stable refs. Its
+  optional `query` and `role` filters also return matching controls.
 - `browser_screenshot` returns MCP image content.
 
 A snapshot looks like:
@@ -46,13 +51,16 @@ A snapshot looks like:
 - button "Continue" [ref=e6e67ce1]
 ```
 
-Ref mappings are stored in server memory. They do not add attributes or global
-variables to the page. Refresh the snapshot after navigation or when a ref is
-reported as stale.
+Each snapshot has a `snapshot_id`, which is embedded in refs such as
+`p1s3:e512f730`. Ref mappings are stored in server memory and do not add
+attributes or global variables to the page. Several recent snapshots are kept
+per page, so taking a new snapshot does not immediately invalidate older refs.
+Refresh after navigation or when a ref is reported as stale or expired.
 
 Snapshots recurse through same-origin and cross-origin Playwright frames,
-including nested frames. Frame refs use a prefix such as `f1:e512f730`, and the
-normal ref tools automatically execute in the correct frame. A frame whose
+including nested frames. Frame refs contain both versions, such as
+`p1s3:f1:e512f730`, and the normal ref tools automatically execute in the
+correct frame. A frame whose
 realm cannot be inspected is still listed as `inaccessible` instead of being
 silently omitted.
 
@@ -64,8 +72,11 @@ silently omitted.
 - `select_ref`
 - `fill_form`
 
-Mutating ref actions return a new snapshot unless `observe=false`. Filled and
-typed values are never echoed; results contain only their lengths.
+Navigation and mutating ref actions accept `observe="none"`, `"compact"`, or
+`"full"`. The default `compact` response refreshes refs and returns the textual
+snapshot without duplicating the structured element/frame arrays. `full`
+returns the complete snapshot; `none` skips observation. Filled and typed
+values are never echoed; results contain only their lengths.
 
 `fill_form` accepts:
 
@@ -78,11 +89,15 @@ typed values are never echoed; results contain only their lengths.
 }
 ```
 
+Each field is a strict object containing exactly `ref` and `value`.
+
 ### Reading and waiting
 
-- `find_text` returns short matching snippets.
+- `browser_find_text` returns short matching snippets.
 - `browser_get_text` returns paginated visible text.
-- `browser_wait` lets short asynchronous page updates settle.
+- `browser_wait_for` waits for page text, a URL substring, a ref state, or a
+  combination of those conditions. Fixed sleeps remain available only in
+  lower-level profiles.
 
 Text results include `offset`, `next_offset`, `full_length`, and `truncated`.
 The default page size is 8,000 characters.
@@ -111,6 +126,9 @@ The lower-level API uses explicit session IDs and CSS selectors.
 
 `evaluate`, raw HTML, cookies, storage state, and arbitrary filesystem paths are
 intended for trusted full-profile workflows.
+
+`add_cookies` accepts either `{name, value, url}` cookies or
+`{name, value, domain, path}` cookies, plus optional Playwright cookie flags.
 
 Storage state contains cookies and localStorage. Treat it as a secret. Save it
 with `save_storage_state` and restore it with
